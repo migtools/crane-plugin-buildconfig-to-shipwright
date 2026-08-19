@@ -96,7 +96,8 @@ func TestConvertDockerStrategyVolumes(t *testing.T) {
 		t.Errorf("unexpected configMap volume: %+v", b.Spec.Volumes[1])
 	}
 
-	var sawSkip, sawOverridable bool
+	var sawSkip, sawSummary bool
+	remediation := map[string]bool{}
 	for _, entry := range hook.AllEntries() {
 		if strings.Contains(entry.Message, `Skipping volume "csi-vol"`) && strings.Contains(entry.Message, "unsupported volume source type") {
 			sawSkip = true
@@ -105,18 +106,44 @@ func TestConvertDockerStrategyVolumes(t *testing.T) {
 			}
 		}
 		if strings.Contains(entry.Message, "Volumes were converted to Build spec volumes") && strings.Contains(entry.Message, "Buildah") {
-			sawOverridable = true
+			sawSummary = true
+			if !strings.Contains(entry.Message, "Registered=False") || !strings.Contains(entry.Message, "UndefinedVolume") {
+				t.Errorf("summary warning must state the real failure (Registered=False, UndefinedVolume), got %q", entry.Message)
+			}
+			if !strings.Contains(entry.Message, "docs/volume-migration.md") {
+				t.Errorf("summary warning must reference the runbook, got %q", entry.Message)
+			}
+			if entry.Level != logrus.WarnLevel {
+				t.Errorf("summary message should be warn-level, got %s", entry.Level)
+			}
+		}
+		for _, name := range []string{"secret-vol", "config-vol"} {
+			if strings.Contains(entry.Message, "add an overridable volume named '"+name+"'") {
+				remediation[name] = true
+				if !strings.Contains(entry.Message, "UndefinedVolume") ||
+					!strings.Contains(entry.Message, "(2) add a volumeMount") ||
+					!strings.Contains(entry.Message, "(3) point the Build at the strategy copy") {
+					t.Errorf("per-volume remediation for %s incomplete: %q", name, entry.Message)
+				}
+			}
 		}
 		// Old wording implying volumes are not converted must be gone.
 		if strings.Contains(entry.Message, "Volumes require the Buildah ClusterBuildStrategy") {
 			t.Errorf("old volumes warning still emitted: %q", entry.Message)
 		}
+		// The pre-BUILD-2324 understatement and stale RFE link must be gone.
+		if strings.Contains(entry.Message, "only take effect") || strings.Contains(entry.Message, "BUILD-1747") {
+			t.Errorf("stale volume warning wording still emitted: %q", entry.Message)
+		}
 	}
 	if !sawSkip {
 		t.Error("expected warn-and-skip message for unsupported CSI volume")
 	}
-	if !sawOverridable {
-		t.Error("expected reworded overridable-volume warning for Docker strategy")
+	if !sawSummary {
+		t.Error("expected UndefinedVolume summary warning for Docker strategy")
+	}
+	if !remediation["secret-vol"] || !remediation["config-vol"] {
+		t.Errorf("expected per-volume remediation warnings for secret-vol and config-vol, got %v", remediation)
 	}
 }
 
@@ -140,14 +167,24 @@ func TestConvertSourceStrategyVolumes(t *testing.T) {
 		t.Fatalf("expected 1 Build spec volume named secret-vol, got %+v", b.Spec.Volumes)
 	}
 
-	sawOverridable := false
+	sawSummary := false
+	sawRemediation := false
 	for _, entry := range hook.AllEntries() {
 		if strings.Contains(entry.Message, "Volumes were converted to Build spec volumes") && strings.Contains(entry.Message, "Source-to-Image") {
-			sawOverridable = true
+			sawSummary = true
+			if !strings.Contains(entry.Message, "Registered=False") || !strings.Contains(entry.Message, "UndefinedVolume") {
+				t.Errorf("summary warning must state the real failure (Registered=False, UndefinedVolume), got %q", entry.Message)
+			}
+		}
+		if strings.Contains(entry.Message, "add an overridable volume named 'secret-vol'") {
+			sawRemediation = true
 		}
 	}
-	if !sawOverridable {
-		t.Error("expected reworded overridable-volume warning for Source strategy")
+	if !sawSummary {
+		t.Error("expected UndefinedVolume summary warning for Source strategy")
+	}
+	if !sawRemediation {
+		t.Error("expected per-volume remediation warning for secret-vol")
 	}
 }
 
@@ -169,23 +206,29 @@ func TestConvertStrategyVolumeMounts(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	sawMounts := false
+	sawRemediation := false
 	for _, entry := range hook.AllEntries() {
 		if entry.Level == logrus.ErrorLevel {
 			t.Errorf("no error-level logs expected, got %q", entry.Message)
 		}
-		if strings.Contains(entry.Message, `Volume mount paths for volume "secret-vol"`) {
-			sawMounts = true
-			if !strings.Contains(entry.Message, "/etc/npm, /etc/pip") {
-				t.Errorf("mounts warning should list destination paths, got %q", entry.Message)
+		if strings.Contains(entry.Message, `Volume "secret-vol" was converted`) {
+			sawRemediation = true
+			if !strings.Contains(entry.Message, "original BuildConfig destination paths: /etc/npm, /etc/pip") {
+				t.Errorf("remediation warning should echo destination paths, got %q", entry.Message)
+			}
+			if !strings.Contains(entry.Message, "(1) add an overridable volume named 'secret-vol'") ||
+				!strings.Contains(entry.Message, "overridable: true") ||
+				!strings.Contains(entry.Message, "(2) add a volumeMount for 'secret-vol'") ||
+				!strings.Contains(entry.Message, "(3) point the Build at the strategy copy via spec.strategy.name") {
+				t.Errorf("remediation warning missing 3-step guidance: %q", entry.Message)
 			}
 			if entry.Level != logrus.WarnLevel {
-				t.Errorf("mounts message should be warn-level, got %s", entry.Level)
+				t.Errorf("remediation message should be warn-level, got %s", entry.Level)
 			}
 		}
 	}
-	if !sawMounts {
-		t.Error("expected warning about non-migratable mount paths")
+	if !sawRemediation {
+		t.Error("expected per-volume remediation warning with mount paths")
 	}
 }
 
@@ -265,11 +308,14 @@ func TestConvertStrategyVolumesAllSkipped(t *testing.T) {
 		t.Fatalf("expected no Build spec volumes, got %+v", b.Spec.Volumes)
 	}
 
-	// When nothing was converted, the "Volumes were converted" message must
-	// not be emitted — it would falsely claim success.
+	// When nothing was converted, neither the summary warning nor a per-volume
+	// remediation warning may be emitted — both would falsely claim success.
 	for _, entry := range hook.AllEntries() {
 		if strings.Contains(entry.Message, "Volumes were converted to Build spec volumes") {
 			t.Errorf("conversion-success warning emitted although no volume was converted: %q", entry.Message)
+		}
+		if strings.Contains(entry.Message, "add an overridable volume named") {
+			t.Errorf("per-volume remediation emitted although no volume was converted: %q", entry.Message)
 		}
 	}
 }

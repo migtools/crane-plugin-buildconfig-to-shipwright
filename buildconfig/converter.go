@@ -28,12 +28,14 @@ const (
 
 	ConvertedFromAnnotation = "crane.konveyor.io/converted-from"
 
-	ConfigMapsRFE            = "https://issues.redhat.com/browse/BUILD-1745"
-	SecretsRFE               = "https://issues.redhat.com/browse/BUILD-1744"
-	DockerStrategyVolumesRFE = "https://issues.redhat.com/browse/BUILD-1747"
-	CustomScriptsRFE         = "https://issues.redhat.com/browse/BUILD-1641"
-	IncrementalBuildRFE      = "https://issues.redhat.com/browse/BUILD-1607"
-	ForcePullFlagS2iRFE      = "https://issues.redhat.com/browse/BUILD-1606"
+	ConfigMapsRFE = "https://issues.redhat.com/browse/BUILD-1745"
+	SecretsRFE    = "https://issues.redhat.com/browse/BUILD-1744"
+	// VolumeMigrationDoc is the runbook for making converted Build volumes
+	// pass Shipwright validation (repo-relative; upstream URL not assumed).
+	VolumeMigrationDoc  = "docs/volume-migration.md in the crane-plugin-buildconfig-to-shipwright repository"
+	CustomScriptsRFE    = "https://issues.redhat.com/browse/BUILD-1641"
+	IncrementalBuildRFE = "https://issues.redhat.com/browse/BUILD-1607"
+	ForcePullFlagS2iRFE = "https://issues.redhat.com/browse/BUILD-1606"
 )
 
 type Converter struct {
@@ -235,11 +237,13 @@ func (c *Converter) processDockerStrategy(bc *buildv1.BuildConfig, b *shipwright
 		}
 	}
 
-	// Volumes — convert to Build spec volumes; full support still requires the
-	// ClusterBuildStrategy to define a matching overridable volume.
+	// Volumes — converted to Build spec volumes under their original names.
+	// Shipwright rejects the Build (Registered=False, reason UndefinedVolume)
+	// until the strategy declares matching overridable volumes; per-volume
+	// remediation is emitted by processStrategyVolumes.
 	if len(ds.Volumes) > 0 {
 		if converted := c.processStrategyVolumes(bc, ds.Volumes, b); converted > 0 {
-			c.Log.Warnf("Volumes were converted to Build spec volumes, but they only take effect if the Buildah ClusterBuildStrategy defines a matching overridable volume. RFE: %s", DockerStrategyVolumesRFE)
+			c.warnStrategyVolumesRejected("Buildah")
 		}
 	}
 
@@ -300,11 +304,13 @@ func (c *Converter) processSourceStrategy(bc *buildv1.BuildConfig, b *shipwright
 	if ss.ForcePull {
 		c.Log.Warnf("ForcePull flag is not yet supported in the Source-to-Image ClusterBuildStrategy in Shipwright. RFE: %s", ForcePullFlagS2iRFE)
 	}
-	// Volumes — convert to Build spec volumes; full support still requires the
-	// ClusterBuildStrategy to define a matching overridable volume.
+	// Volumes — converted to Build spec volumes under their original names.
+	// Shipwright rejects the Build (Registered=False, reason UndefinedVolume)
+	// until the strategy declares matching overridable volumes; per-volume
+	// remediation is emitted by processStrategyVolumes.
 	if len(ss.Volumes) > 0 {
 		if converted := c.processStrategyVolumes(bc, ss.Volumes, b); converted > 0 {
-			c.Log.Warnf("Volumes were converted to Build spec volumes, but they only take effect if the Source-to-Image ClusterBuildStrategy defines a matching overridable volume. RFE: %s", DockerStrategyVolumesRFE)
+			c.warnStrategyVolumesRejected("Source-to-Image")
 		}
 	}
 
@@ -315,8 +321,10 @@ func (c *Converter) processSourceStrategy(bc *buildv1.BuildConfig, b *shipwright
 // Build spec volumes and returns the number of volumes appended. Secret and
 // ConfigMap sources are supported; volumes with an empty name, a duplicate
 // name, or an unsupported source type are skipped with a warning so the rest
-// of the conversion can proceed. Volume mount paths are not migrated: mount
-// paths are defined in the BuildStrategy, not in the Build resource.
+// of the conversion can proceed. Each converted volume gets a remediation
+// warning: Shipwright matches Build volumes to strategy volumes by exact
+// name, takes mount paths only from strategy step volumeMounts, and rejects
+// Builds whose volume names the strategy does not declare (UndefinedVolume).
 func (c *Converter) processStrategyVolumes(bc *buildv1.BuildConfig, volumes []buildv1.BuildVolume, b *shipwrightv1beta1.Build) int {
 	converted := 0
 	seen := make(map[string]bool, len(volumes))
@@ -345,15 +353,25 @@ func (c *Converter) processStrategyVolumes(bc *buildv1.BuildConfig, volumes []bu
 		})
 		converted++
 
+		destinations := "no destination paths were declared in the BuildConfig; use the path your build expects"
 		if len(bcVolume.Mounts) > 0 {
 			paths := make([]string, 0, len(bcVolume.Mounts))
 			for _, m := range bcVolume.Mounts {
 				paths = append(paths, m.DestinationPath)
 			}
-			c.Log.Warnf("Volume mount paths for volume %q can not be migrated to the Shipwright Build; mount paths are defined in the BuildStrategy. Original destination paths: %s", bcVolume.Name, strings.Join(paths, ", "))
+			destinations = "original BuildConfig destination paths: " + strings.Join(paths, ", ")
 		}
+		c.Log.Warnf("Volume %q was converted, but the Build will fail validation (reason: UndefinedVolume) until you: (1) add an overridable volume named '%s' to your ClusterBuildStrategy copy — volumes: [{name: %s, overridable: true, emptyDir: {}}] (placeholder source; the converted Build's override supplies the real Secret/ConfigMap), (2) add a volumeMount for '%s' on the strategy build step (%s), (3) point the Build at the strategy copy via spec.strategy.name. See %s.", bcVolume.Name, bcVolume.Name, bcVolume.Name, bcVolume.Name, destinations, VolumeMigrationDoc)
 	}
 	return converted
+}
+
+// warnStrategyVolumesRejected emits the per-BuildConfig summary warning for
+// converted strategy volumes: Shipwright validates Build spec volumes by name
+// against the strategy, so conversion alone leaves the Build failing
+// validation until the strategy declares the volumes.
+func (c *Converter) warnStrategyVolumesRejected(strategyLabel string) {
+	c.Log.Warnf("Volumes were converted to Build spec volumes, but the shipped %s ClusterBuildStrategy does not declare them: Shipwright will reject the Build (Registered=False, reason: UndefinedVolume) until a matching volume with 'overridable: true' is added to a copy of the strategy. See %s.", strategyLabel, VolumeMigrationDoc)
 }
 
 // convertBuildVolumeSource converts an OpenShift BuildVolumeSource into the
