@@ -48,6 +48,10 @@ func trustedCABuildConfigRequest(strategyType, strategyKey string, mountTrustedC
 	}
 }
 
+// The request builder names its BuildConfig trusted-ca-app; the converter
+// derives the per-Build ConfigMap name from the converted Build's name.
+const testTrustedCAConfigMapName = "trusted-ca-app" + TrustedCABundleConfigMapSuffix
+
 func findConfigMap(resp transform.PluginResponse, name string) *unstructured.Unstructured {
 	for i := range resp.NewResources {
 		r := resp.NewResources[i]
@@ -83,16 +87,16 @@ func TestConvertMountTrustedCA(t *testing.T) {
 			if vol.Name != TrustedCAVolumeName {
 				t.Errorf("expected volume name %q, got %q", TrustedCAVolumeName, vol.Name)
 			}
-			if vol.ConfigMap == nil || vol.ConfigMap.Name != TrustedCABundleConfigMapName {
-				t.Errorf("expected configMap volume source %q, got %+v", TrustedCABundleConfigMapName, vol.VolumeSource)
+			if vol.ConfigMap == nil || vol.ConfigMap.Name != testTrustedCAConfigMapName {
+				t.Errorf("expected configMap volume source %q, got %+v", testTrustedCAConfigMapName, vol.VolumeSource)
 			}
 			if vol.ConfigMap != nil && (len(vol.ConfigMap.Items) != 1 || vol.ConfigMap.Items[0].Key != TrustedCABundleKey || vol.ConfigMap.Items[0].Path != TrustedCABundleKey) {
 				t.Errorf("expected volume projection restricted to %s, got %+v", TrustedCABundleKey, vol.ConfigMap.Items)
 			}
 
-			cm := findConfigMap(resp, TrustedCABundleConfigMapName)
+			cm := findConfigMap(resp, testTrustedCAConfigMapName)
 			if cm == nil {
-				t.Fatalf("expected ConfigMap %q in new resources, got %+v", TrustedCABundleConfigMapName, resp.NewResources)
+				t.Fatalf("expected ConfigMap %q in new resources, got %+v", testTrustedCAConfigMapName, resp.NewResources)
 			}
 			if cm.GetNamespace() != "myns" {
 				t.Errorf("expected ConfigMap namespace myns, got %q", cm.GetNamespace())
@@ -126,7 +130,7 @@ func TestConvertMountTrustedCADisabled(t *testing.T) {
 	if len(b.Spec.Volumes) != 0 {
 		t.Errorf("expected no Build spec volumes, got %+v", b.Spec.Volumes)
 	}
-	if cm := findConfigMap(resp, TrustedCABundleConfigMapName); cm != nil {
+	if cm := findConfigMap(resp, testTrustedCAConfigMapName); cm != nil {
 		t.Errorf("expected no trusted CA ConfigMap, got %+v", cm)
 	}
 }
@@ -154,7 +158,7 @@ func TestConvertMountTrustedCAVolumeNameCollision(t *testing.T) {
 	if b.Spec.Volumes[0].ConfigMap == nil || b.Spec.Volumes[0].ConfigMap.Name != "my-own-ca" {
 		t.Errorf("expected explicit volume backed by my-own-ca to be kept, got %+v", b.Spec.Volumes[0])
 	}
-	if cm := findConfigMap(resp, TrustedCABundleConfigMapName); cm != nil {
+	if cm := findConfigMap(resp, testTrustedCAConfigMapName); cm != nil {
 		t.Errorf("expected no trusted CA ConfigMap when mapping is skipped, got %+v", cm)
 	}
 
@@ -208,12 +212,12 @@ func TestConvertMountTrustedCACustomStrategyWarning(t *testing.T) {
 	}
 	var sawConfigMap bool
 	for _, r := range result[1:] {
-		if r.GetKind() == "ConfigMap" && r.GetName() == TrustedCABundleConfigMapName {
+		if r.GetKind() == "ConfigMap" && r.GetName() == testTrustedCAConfigMapName {
 			sawConfigMap = true
 		}
 	}
 	if !sawConfigMap {
-		t.Fatalf("expected ConfigMap %q among converted resources, got %+v", TrustedCABundleConfigMapName, result)
+		t.Fatalf("expected ConfigMap %q among converted resources, got %+v", testTrustedCAConfigMapName, result)
 	}
 
 	// The warning must state the real outcome per the BUILD-2324 fail-visible
@@ -250,7 +254,7 @@ func TestConvertMountTrustedCAAbsent(t *testing.T) {
 	if len(b.Spec.Volumes) != 0 {
 		t.Errorf("expected no Build spec volumes, got %+v", b.Spec.Volumes)
 	}
-	if cm := findConfigMap(resp, TrustedCABundleConfigMapName); cm != nil {
+	if cm := findConfigMap(resp, testTrustedCAConfigMapName); cm != nil {
 		t.Errorf("expected no trusted CA ConfigMap, got %+v", cm)
 	}
 }
@@ -279,7 +283,7 @@ func TestConvertMountTrustedCAWithOtherVolumes(t *testing.T) {
 	if !names["other-vol"] || !names[TrustedCAVolumeName] {
 		t.Errorf("expected volumes other-vol and %s, got %+v", TrustedCAVolumeName, names)
 	}
-	if cm := findConfigMap(resp, TrustedCABundleConfigMapName); cm == nil {
+	if cm := findConfigMap(resp, testTrustedCAConfigMapName); cm == nil {
 		t.Error("expected trusted CA ConfigMap alongside non-colliding volumes")
 	}
 }
@@ -304,7 +308,7 @@ func TestConvertMountTrustedCAUnsupportedSourceCollision(t *testing.T) {
 	if len(b.Spec.Volumes) != 0 {
 		t.Fatalf("expected no Build spec volumes (user volume skipped, mapping deferred), got %+v", b.Spec.Volumes)
 	}
-	if cm := findConfigMap(resp, TrustedCABundleConfigMapName); cm != nil {
+	if cm := findConfigMap(resp, testTrustedCAConfigMapName); cm != nil {
 		t.Errorf("expected no trusted CA ConfigMap when mapping is skipped, got %+v", cm)
 	}
 	var sawSkip bool
@@ -318,7 +322,7 @@ func TestConvertMountTrustedCAUnsupportedSourceCollision(t *testing.T) {
 	}
 }
 
-func TestConvertMountTrustedCASharedNamespaceDedup(t *testing.T) {
+func TestConvertMountTrustedCAPerBuildConfigMaps(t *testing.T) {
 	logger, _ := logrustest.NewNullLogger()
 	c := &Converter{Log: logger}
 	mount := true
@@ -334,14 +338,13 @@ func TestConvertMountTrustedCASharedNamespaceDedup(t *testing.T) {
 		bc.Spec.Output.To = &corev1.ObjectReference{Kind: "DockerImage", Name: "quay.io/example/myapp:latest"}
 		return bc
 	}
-	countCMs := func(result []unstructured.Unstructured) int {
-		n := 0
+	hasCM := func(result []unstructured.Unstructured, name string) bool {
 		for _, r := range result {
-			if r.GetKind() == "ConfigMap" && r.GetName() == TrustedCABundleConfigMapName {
-				n++
+			if r.GetKind() == "ConfigMap" && r.GetName() == name {
+				return true
 			}
 		}
-		return n
+		return false
 	}
 
 	first, err := c.Convert(newBC("app-one"))
@@ -353,16 +356,24 @@ func TestConvertMountTrustedCASharedNamespaceDedup(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if n := countCMs(first); n != 1 {
-		t.Errorf("expected 1 trusted CA ConfigMap from first conversion, got %d", n)
-	}
-	if n := countCMs(second); n != 0 {
-		t.Errorf("expected no duplicate trusted CA ConfigMap from second conversion in same namespace, got %d", n)
-	}
-	for _, result := range [][]unstructured.Unstructured{first, second} {
-		vols, _, err := unstructured.NestedSlice(result[0].Object, "spec", "volumes")
+	// Each conversion owns its own ConfigMap, named after its Build.
+	for i, tc := range []struct {
+		result []unstructured.Unstructured
+		want   string
+	}{
+		{first, "app-one" + TrustedCABundleConfigMapSuffix},
+		{second, "app-two" + TrustedCABundleConfigMapSuffix},
+	} {
+		if !hasCM(tc.result, tc.want) {
+			t.Errorf("conversion %d: expected per-Build ConfigMap %q, got %+v", i, tc.want, tc.result)
+		}
+		vols, _, err := unstructured.NestedSlice(tc.result[0].Object, "spec", "volumes")
 		if err != nil || len(vols) != 1 {
-			t.Fatalf("expected 1 Build spec volume on each converted Build, got %v (err %v)", vols, err)
+			t.Fatalf("conversion %d: expected 1 Build spec volume, got %v (err %v)", i, vols, err)
+		}
+		cmRef, _, _ := unstructured.NestedString(vols[0].(map[string]interface{}), "configMap", "name")
+		if cmRef != tc.want {
+			t.Errorf("conversion %d: expected volume to reference its own ConfigMap %q, got %q", i, tc.want, cmRef)
 		}
 	}
 }
