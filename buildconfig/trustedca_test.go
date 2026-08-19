@@ -86,6 +86,9 @@ func TestConvertMountTrustedCA(t *testing.T) {
 			if vol.ConfigMap == nil || vol.ConfigMap.Name != TrustedCABundleConfigMapName {
 				t.Errorf("expected configMap volume source %q, got %+v", TrustedCABundleConfigMapName, vol.VolumeSource)
 			}
+			if vol.ConfigMap != nil && (len(vol.ConfigMap.Items) != 1 || vol.ConfigMap.Items[0].Key != TrustedCABundleKey || vol.ConfigMap.Items[0].Path != TrustedCABundleKey) {
+				t.Errorf("expected volume projection restricted to %s, got %+v", TrustedCABundleKey, vol.ConfigMap.Items)
+			}
 
 			cm := findConfigMap(resp, TrustedCABundleConfigMapName)
 			if cm == nil {
@@ -96,6 +99,9 @@ func TestConvertMountTrustedCA(t *testing.T) {
 			}
 			if v := cm.GetLabels()[InjectTrustedCABundleLabel]; v != "true" {
 				t.Errorf("expected label %s=true on ConfigMap, got labels %+v", InjectTrustedCABundleLabel, cm.GetLabels())
+			}
+			if v := cm.GetAnnotations()[ConvertedFromAnnotation]; v == "" {
+				t.Errorf("expected %s annotation on ConfigMap for traceability, got %+v", ConvertedFromAnnotation, cm.GetAnnotations())
 			}
 
 			// Shipped strategies define the trusted-ca volume: no warning expected.
@@ -192,7 +198,26 @@ func TestConvertMountTrustedCACustomStrategyWarning(t *testing.T) {
 	}
 
 	// The volume is still appended — the user may have added trusted-ca to
-	// their custom strategy — but a warning must flag the requirement.
+	// their custom strategy — and the emitted resources must prove it.
+	vols, _, err := unstructured.NestedSlice(result[0].Object, "spec", "volumes")
+	if err != nil || len(vols) != 1 {
+		t.Fatalf("expected 1 Build spec volume on custom-strategy Build, got %v (err %v)", vols, err)
+	}
+	if name, _, _ := unstructured.NestedString(vols[0].(map[string]interface{}), "name"); name != TrustedCAVolumeName {
+		t.Errorf("expected volume %q on Build, got %q", TrustedCAVolumeName, name)
+	}
+	var sawConfigMap bool
+	for _, r := range result[1:] {
+		if r.GetKind() == "ConfigMap" && r.GetName() == TrustedCABundleConfigMapName {
+			sawConfigMap = true
+		}
+	}
+	if !sawConfigMap {
+		t.Fatalf("expected ConfigMap %q among converted resources, got %+v", TrustedCABundleConfigMapName, result)
+	}
+
+	// The warning must state the real outcome per the BUILD-2324 fail-visible
+	// contract: Shipwright rejects the Build, it does not sit inert.
 	var sawWarning bool
 	for _, entry := range hook.AllEntries() {
 		if strings.Contains(entry.Message, "not a shipped strategy") && strings.Contains(entry.Message, "my-custom-strategy") {
@@ -200,9 +225,144 @@ func TestConvertMountTrustedCACustomStrategyWarning(t *testing.T) {
 			if entry.Level != logrus.WarnLevel {
 				t.Errorf("non-shipped-strategy message should be warn-level, got %s", entry.Level)
 			}
+			if !strings.Contains(entry.Message, "UndefinedVolume") || !strings.Contains(entry.Message, "Registered=False") {
+				t.Errorf("warning should state the UndefinedVolume rejection outcome, got %q", entry.Message)
+			}
 		}
 	}
 	if !sawWarning {
 		t.Error("expected non-shipped-strategy warning for custom strategy mapping")
+	}
+}
+
+func TestConvertMountTrustedCAAbsent(t *testing.T) {
+	logger, _ := logrustest.NewNullLogger()
+	plugin := &BuildConfigTransformPlugin{Log: logger}
+	req := trustedCABuildConfigRequest("Docker", "dockerStrategy", false, nil)
+	spec := req.Unstructured.Object["spec"].(map[string]interface{})
+	delete(spec, "mountTrustedCA") // field absent → nil-pointer branch
+	resp, err := plugin.Run(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	b := decodeBuild(t, resp)
+	if len(b.Spec.Volumes) != 0 {
+		t.Errorf("expected no Build spec volumes, got %+v", b.Spec.Volumes)
+	}
+	if cm := findConfigMap(resp, TrustedCABundleConfigMapName); cm != nil {
+		t.Errorf("expected no trusted CA ConfigMap, got %+v", cm)
+	}
+}
+
+func TestConvertMountTrustedCAWithOtherVolumes(t *testing.T) {
+	logger, _ := logrustest.NewNullLogger()
+	plugin := &BuildConfigTransformPlugin{Log: logger}
+	resp, err := plugin.Run(trustedCABuildConfigRequest("Docker", "dockerStrategy", true, []interface{}{
+		map[string]interface{}{
+			"name":   "other-vol",
+			"source": map[string]interface{}{"type": "ConfigMap", "configMap": map[string]interface{}{"name": "other-cm"}},
+		},
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	b := decodeBuild(t, resp)
+	if len(b.Spec.Volumes) != 2 {
+		t.Fatalf("expected 2 Build spec volumes (other-vol + trusted-ca), got %d: %+v", len(b.Spec.Volumes), b.Spec.Volumes)
+	}
+	names := map[string]bool{}
+	for _, v := range b.Spec.Volumes {
+		names[v.Name] = true
+	}
+	if !names["other-vol"] || !names[TrustedCAVolumeName] {
+		t.Errorf("expected volumes other-vol and %s, got %+v", TrustedCAVolumeName, names)
+	}
+	if cm := findConfigMap(resp, TrustedCABundleConfigMapName); cm == nil {
+		t.Error("expected trusted CA ConfigMap alongside non-colliding volumes")
+	}
+}
+
+func TestConvertMountTrustedCAUnsupportedSourceCollision(t *testing.T) {
+	logger, hook := logrustest.NewNullLogger()
+	plugin := &BuildConfigTransformPlugin{Log: logger}
+	// A user-declared trusted-ca volume with an unsupported source is skipped
+	// by processStrategyVolumes — the mapping must still defer to it instead
+	// of silently substituting the injected cluster bundle.
+	resp, err := plugin.Run(trustedCABuildConfigRequest("Docker", "dockerStrategy", true, []interface{}{
+		map[string]interface{}{
+			"name":   TrustedCAVolumeName,
+			"source": map[string]interface{}{"type": "CSI"},
+		},
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	b := decodeBuild(t, resp)
+	if len(b.Spec.Volumes) != 0 {
+		t.Fatalf("expected no Build spec volumes (user volume skipped, mapping deferred), got %+v", b.Spec.Volumes)
+	}
+	if cm := findConfigMap(resp, TrustedCABundleConfigMapName); cm != nil {
+		t.Errorf("expected no trusted CA ConfigMap when mapping is skipped, got %+v", cm)
+	}
+	var sawSkip bool
+	for _, entry := range hook.AllEntries() {
+		if strings.Contains(entry.Message, "skipping the trusted CA mapping") {
+			sawSkip = true
+		}
+	}
+	if !sawSkip {
+		t.Error("expected warn-and-skip message for user-declared trusted-ca volume with unsupported source")
+	}
+}
+
+func TestConvertMountTrustedCASharedNamespaceDedup(t *testing.T) {
+	logger, _ := logrustest.NewNullLogger()
+	c := &Converter{Log: logger}
+	mount := true
+	newBC := func(name string) *buildv1.BuildConfig {
+		bc := &buildv1.BuildConfig{}
+		bc.Name = name
+		bc.Namespace = "myns"
+		bc.Spec.MountTrustedCA = &mount
+		bc.Spec.Strategy = buildv1.BuildStrategy{
+			Type:           buildv1.DockerBuildStrategyType,
+			DockerStrategy: &buildv1.DockerBuildStrategy{},
+		}
+		bc.Spec.Output.To = &corev1.ObjectReference{Kind: "DockerImage", Name: "quay.io/example/myapp:latest"}
+		return bc
+	}
+	countCMs := func(result []unstructured.Unstructured) int {
+		n := 0
+		for _, r := range result {
+			if r.GetKind() == "ConfigMap" && r.GetName() == TrustedCABundleConfigMapName {
+				n++
+			}
+		}
+		return n
+	}
+
+	first, err := c.Convert(newBC("app-one"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	second, err := c.Convert(newBC("app-two"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if n := countCMs(first); n != 1 {
+		t.Errorf("expected 1 trusted CA ConfigMap from first conversion, got %d", n)
+	}
+	if n := countCMs(second); n != 0 {
+		t.Errorf("expected no duplicate trusted CA ConfigMap from second conversion in same namespace, got %d", n)
+	}
+	for _, result := range [][]unstructured.Unstructured{first, second} {
+		vols, _, err := unstructured.NestedSlice(result[0].Object, "spec", "volumes")
+		if err != nil || len(vols) != 1 {
+			t.Fatalf("expected 1 Build spec volume on each converted Build, got %v (err %v)", vols, err)
+		}
 	}
 }

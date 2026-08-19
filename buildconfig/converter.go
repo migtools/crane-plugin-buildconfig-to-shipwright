@@ -35,6 +35,11 @@ const (
 	// TrustedCABundleConfigMapName is the namespace-local ConfigMap the
 	// converter emits to back the trusted-ca volume.
 	TrustedCABundleConfigMapName = "trusted-ca-bundle"
+	// TrustedCABundleKey is the ConfigMap key the Cluster Network Operator
+	// injects the cluster CA bundle under. The volume projection is restricted
+	// to this key so stray keys added to the shared ConfigMap can never enter
+	// the build's trust store (matches native OpenShift build behavior).
+	TrustedCABundleKey = "ca-bundle.crt"
 	// InjectTrustedCABundleLabel asks the Cluster Network Operator to inject
 	// the cluster-wide CA bundle into the labeled ConfigMap as ca-bundle.crt —
 	// the same mechanism OpenShift builds use for spec.mountTrustedCA.
@@ -60,6 +65,10 @@ type Converter struct {
 	// that BuildConfigs sharing a builder ServiceAccount merge their
 	// imagePullSecrets instead of overwriting each other.
 	serviceAccounts map[string]*corev1.ServiceAccount
+	// trustedCAConfigMaps tracks namespaces for which the shared trusted CA
+	// bundle ConfigMap was already emitted, so converting multiple
+	// BuildConfigs in one lifetime yields a single ConfigMap per namespace.
+	trustedCAConfigMaps map[string]bool
 }
 
 // uniqueName sanitizes a generated resource name into a valid DNS-1123 label
@@ -411,6 +420,20 @@ func (c *Converter) getPullSecret(bc *buildv1.BuildConfig) *corev1.LocalObjectRe
 	return nil
 }
 
+// bcStrategyVolumes returns the volumes declared on the BuildConfig's
+// strategy regardless of whether they survived conversion — a user-declared
+// volume that was skipped (unsupported source) must still block the trusted
+// CA mapping rather than be silently replaced by the injected bundle.
+func bcStrategyVolumes(bc *buildv1.BuildConfig) []buildv1.BuildVolume {
+	if ds := bc.Spec.Strategy.DockerStrategy; ds != nil {
+		return ds.Volumes
+	}
+	if ss := bc.Spec.Strategy.SourceStrategy; ss != nil {
+		return ss.Volumes
+	}
+	return nil
+}
+
 // processMountTrustedCA maps spec.mountTrustedCA to the overridable
 // "trusted-ca" volume defined by the shipped buildah and source-to-image
 // ClusterBuildStrategies (strategy-catalog PR #30). It appends a Build spec
@@ -419,17 +442,39 @@ func (c *Converter) getPullSecret(bc *buildv1.BuildConfig) *corev1.LocalObjectRe
 // config.openshift.io/inject-trusted-cabundle=true label so the Cluster
 // Network Operator injects the cluster CA bundle into it as ca-bundle.crt —
 // the same mechanism OpenShift builds use — which the strategy's CA import
-// step then picks up via its *.crt glob.
+// step then picks up via its *.crt glob. The projection is restricted to the
+// ca-bundle.crt key, so the mount fails visibly (rather than silently
+// building without the requested trust) until the injector populates the
+// ConfigMap; on clusters without the Cluster Network Operator the key must
+// be populated manually. The ConfigMap is emitted once per namespace per
+// converter lifetime.
 func (c *Converter) processMountTrustedCA(bc *buildv1.BuildConfig, b *shipwrightv1beta1.Build) *corev1.ConfigMap {
 	if bc.Spec.MountTrustedCA == nil || !*bc.Spec.MountTrustedCA {
 		return nil
 	}
 
+	declared := false
 	for _, v := range b.Spec.Volumes {
 		if v.Name == TrustedCAVolumeName {
-			c.Log.Warnf("BuildConfig %s sets mountTrustedCA but already declares a strategy volume named %q — keeping the explicit volume and skipping the trusted CA mapping", bc.Name, TrustedCAVolumeName)
-			return nil
+			declared = true
+			break
 		}
+	}
+	if !declared {
+		// Also check the original BuildConfig strategy volumes: a user-declared
+		// trusted-ca volume whose source could not be converted was skipped by
+		// processStrategyVolumes (with its own warning) and must not be
+		// silently replaced by the injected cluster bundle.
+		for _, v := range bcStrategyVolumes(bc) {
+			if v.Name == TrustedCAVolumeName {
+				declared = true
+				break
+			}
+		}
+	}
+	if declared {
+		c.Log.Warnf("BuildConfig %s sets mountTrustedCA but already declares a strategy volume named %q — deferring to the explicit volume and skipping the trusted CA mapping (if the explicit volume was itself skipped as unsupported, migrate its CA source manually)", bc.Name, TrustedCAVolumeName)
+		return nil
 	}
 
 	b.Spec.Volumes = append(b.Spec.Volumes, shipwrightv1beta1.BuildVolume{
@@ -437,13 +482,30 @@ func (c *Converter) processMountTrustedCA(bc *buildv1.BuildConfig, b *shipwright
 		VolumeSource: corev1.VolumeSource{
 			ConfigMap: &corev1.ConfigMapVolumeSource{
 				LocalObjectReference: corev1.LocalObjectReference{Name: TrustedCABundleConfigMapName},
+				// Only the operator-managed bundle key is projected: extra keys
+				// added to the shared ConfigMap never enter the trust store, and
+				// a missing key fails the mount visibly instead of silently
+				// building without the requested trust.
+				Items: []corev1.KeyToPath{{Key: TrustedCABundleKey, Path: TrustedCABundleKey}},
 			},
 		},
 	})
 
+	c.Log.Warnf("mountTrustedCA for BuildConfig %s relies on the OpenShift Cluster Network Operator injecting the cluster CA bundle into ConfigMap %q (label %s); on clusters without that injector the %s key stays absent and BuildRun pods will fail to mount the %q volume until the key is populated manually", bc.Name, TrustedCABundleConfigMapName, InjectTrustedCABundleLabel, TrustedCABundleKey, TrustedCAVolumeName)
+
 	if name := b.Spec.Strategy.Name; name != defaultDockerStrategy && name != defaultS2IStrategy {
-		c.Log.Warnf("mountTrustedCA was mapped to the %q volume for BuildConfig %s, but the target ClusterBuildStrategy %q is not a shipped strategy — the volume only takes effect if the strategy defines a matching overridable volume", TrustedCAVolumeName, bc.Name, name)
+		c.Log.Warnf("mountTrustedCA was mapped to the %q volume for BuildConfig %s, but the target ClusterBuildStrategy %q is not a shipped strategy — Shipwright will reject the Build (Registered=False, reason UndefinedVolume) unless the strategy declares a matching overridable volume: volumes: [{name: %s, overridable: true, emptyDir: {}}] plus a volumeMount on the build step", TrustedCAVolumeName, bc.Name, name, TrustedCAVolumeName)
 	}
+
+	if c.trustedCAConfigMaps == nil {
+		c.trustedCAConfigMaps = map[string]bool{}
+	}
+	if c.trustedCAConfigMaps[bc.Namespace] {
+		// Already emitted for this namespace in this converter lifetime — the
+		// ConfigMap is shared; only the Build volume differs per BuildConfig.
+		return nil
+	}
+	c.trustedCAConfigMaps[bc.Namespace] = true
 
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
@@ -455,6 +517,9 @@ func (c *Converter) processMountTrustedCA(bc *buildv1.BuildConfig, b *shipwright
 			Namespace: bc.Namespace,
 			Labels: map[string]string{
 				InjectTrustedCABundleLabel: "true",
+			},
+			Annotations: map[string]string{
+				ConvertedFromAnnotation: "build.openshift.io/v1/BuildConfig spec.mountTrustedCA",
 			},
 		},
 	}
