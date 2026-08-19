@@ -28,6 +28,18 @@ const (
 
 	ConvertedFromAnnotation = "crane.konveyor.io/converted-from"
 
+	// TrustedCAVolumeName is the overridable volume defined by the shipped
+	// buildah and source-to-image ClusterBuildStrategies for CA bundle
+	// injection (strategy-catalog PR #30, BUILD-2324).
+	TrustedCAVolumeName = "trusted-ca"
+	// TrustedCABundleConfigMapName is the namespace-local ConfigMap the
+	// converter emits to back the trusted-ca volume.
+	TrustedCABundleConfigMapName = "trusted-ca-bundle"
+	// InjectTrustedCABundleLabel asks the Cluster Network Operator to inject
+	// the cluster-wide CA bundle into the labeled ConfigMap as ca-bundle.crt —
+	// the same mechanism OpenShift builds use for spec.mountTrustedCA.
+	InjectTrustedCABundleLabel = "config.openshift.io/inject-trusted-cabundle"
+
 	ConfigMapsRFE            = "https://issues.redhat.com/browse/BUILD-1745"
 	SecretsRFE               = "https://issues.redhat.com/browse/BUILD-1744"
 	DockerStrategyVolumesRFE = "https://issues.redhat.com/browse/BUILD-1747"
@@ -125,6 +137,16 @@ func (c *Converter) Convert(bc *buildv1.BuildConfig) ([]unstructured.Unstructure
 			return nil, fmt.Errorf("error converting ServiceAccount to unstructured: %w", err)
 		}
 		newResources = append(newResources, saUnstructured)
+	}
+
+	// MountTrustedCA → trusted-ca volume override backed by an injected CA
+	// bundle ConfigMap.
+	if caConfigMap := c.processMountTrustedCA(bc, b); caConfigMap != nil {
+		cmUnstructured, err := toUnstructured(caConfigMap)
+		if err != nil {
+			return nil, fmt.Errorf("error converting trusted CA ConfigMap to unstructured: %w", err)
+		}
+		newResources = append(newResources, cmUnstructured)
 	}
 
 	c.processSource(bc, b)
@@ -387,6 +409,55 @@ func (c *Converter) getPullSecret(bc *buildv1.BuildConfig) *corev1.LocalObjectRe
 		return bc.Spec.Strategy.SourceStrategy.PullSecret
 	}
 	return nil
+}
+
+// processMountTrustedCA maps spec.mountTrustedCA to the overridable
+// "trusted-ca" volume defined by the shipped buildah and source-to-image
+// ClusterBuildStrategies (strategy-catalog PR #30). It appends a Build spec
+// volume backed by a namespace-local ConfigMap and returns that ConfigMap so
+// the caller can emit it alongside the Build. The ConfigMap carries the
+// config.openshift.io/inject-trusted-cabundle=true label so the Cluster
+// Network Operator injects the cluster CA bundle into it as ca-bundle.crt —
+// the same mechanism OpenShift builds use — which the strategy's CA import
+// step then picks up via its *.crt glob.
+func (c *Converter) processMountTrustedCA(bc *buildv1.BuildConfig, b *shipwrightv1beta1.Build) *corev1.ConfigMap {
+	if bc.Spec.MountTrustedCA == nil || !*bc.Spec.MountTrustedCA {
+		return nil
+	}
+
+	for _, v := range b.Spec.Volumes {
+		if v.Name == TrustedCAVolumeName {
+			c.Log.Warnf("BuildConfig %s sets mountTrustedCA but already declares a strategy volume named %q — keeping the explicit volume and skipping the trusted CA mapping", bc.Name, TrustedCAVolumeName)
+			return nil
+		}
+	}
+
+	b.Spec.Volumes = append(b.Spec.Volumes, shipwrightv1beta1.BuildVolume{
+		Name: TrustedCAVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: TrustedCABundleConfigMapName},
+			},
+		},
+	})
+
+	if name := b.Spec.Strategy.Name; name != defaultDockerStrategy && name != defaultS2IStrategy {
+		c.Log.Warnf("mountTrustedCA was mapped to the %q volume for BuildConfig %s, but the target ClusterBuildStrategy %q is not a shipped strategy — the volume only takes effect if the strategy defines a matching overridable volume", TrustedCAVolumeName, bc.Name, name)
+	}
+
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      TrustedCABundleConfigMapName,
+			Namespace: bc.Namespace,
+			Labels: map[string]string{
+				InjectTrustedCABundleLabel: "true",
+			},
+		},
+	}
 }
 
 func (c *Converter) generateServiceAccount(bc *buildv1.BuildConfig, pullSecret *corev1.LocalObjectReference) *corev1.ServiceAccount {
