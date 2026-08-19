@@ -354,11 +354,15 @@ func (c *Converter) processStrategyVolumes(bc *buildv1.BuildConfig, volumes []bu
 		converted++
 
 		destinations := "no destination paths were declared in the BuildConfig; use the path your build expects"
-		if len(bcVolume.Mounts) > 0 {
-			paths := make([]string, 0, len(bcVolume.Mounts))
-			for _, m := range bcVolume.Mounts {
+		paths := make([]string, 0, len(bcVolume.Mounts))
+		for _, m := range bcVolume.Mounts {
+			// Defensive: file-sourced BuildConfigs may carry empty destination
+			// paths that API-server validation would normally reject.
+			if m.DestinationPath != "" {
 				paths = append(paths, m.DestinationPath)
 			}
+		}
+		if len(paths) > 0 {
 			destinations = "original BuildConfig destination paths: " + strings.Join(paths, ", ")
 		}
 		c.Log.Warnf("Volume %q was converted, but the Build will fail validation (reason: UndefinedVolume) until you: (1) add an overridable volume named '%s' to your ClusterBuildStrategy copy — volumes: [{name: %s, overridable: true, emptyDir: {}}] (placeholder source; the converted Build's override supplies the real Secret/ConfigMap), (2) add a volumeMount for '%s' on the strategy build step (%s), (3) point the Build at the strategy copy via spec.strategy.name. See %s.", bcVolume.Name, bcVolume.Name, bcVolume.Name, bcVolume.Name, destinations, VolumeMigrationDoc)
