@@ -20,7 +20,10 @@ Parse the argument:
 - Matches `BUILD-XXXX` and is an Epic: list all issues under that epic, present them, and
   triage one at a time
 - Matches `BUILD-XXXX` and is a Story/Spike/Task: deep-dive that single issue
-- Blank: default to epics BUILD-1848 and BUILD-1655
+- Blank: default to all four enhancement epics — BUILD-1848 (Phase 1), BUILD-1655
+  (Phase 2), BUILD-2254 (Phase 3), BUILD-2394 (Phase 4). Confirm the list is still current
+  with:
+  `jira issue list --jql "project = BUILD AND issuetype = Epic AND summary ~ 'Migration Tool'" --plain`
 
 ## Iron Law
 
@@ -28,7 +31,11 @@ Parse the argument:
 
 - Do NOT assign priority until all research phases are complete
 - Do NOT skip the strategy-catalog check — upstream and downstream strategies diverge
-- Do NOT claim "not implemented" without checking TRACKER, merged code, and open PRs — the work may already exist or be in flight (see **Phase 5**)
+- Do NOT claim "not implemented" without checking TRACKER, merged code, open PRs, AND
+  sibling stories in the epics — the work may already exist, be in flight, or be owned by a
+  different open story (see **Phase 5**)
+- Do NOT repeat a status, title, or branch claim read from TRACKER.md without verifying it
+  against Jira and `gh` first — TRACKER rows go stale (see **Phase 5a**)
 - Do NOT write anything until the user approves — see **Phase 9**
 - Every claim must cite a specific `file:line` or search result — no guessing
 
@@ -301,19 +308,43 @@ per-source-field and never per-destination-outcome.)_
 
 ### Phase 5: Has this already been done?
 
-Answer one question — *is this feature already delivered, or in flight right now?* —
-from the tracked sources of truth, checked cheapest and most reliable first. Stop at the
-first hit. Do not crawl every branch: if work is real, it is recorded as a Jira story /
-TRACKER row or an open PR. Trust that.
+Answer two questions:
 
-**5a. TRACKER.md — the master record**
+1. *Is this feature already delivered, or in flight right now?* (5a–5c, looking **backwards**)
+2. *Does another open story already own this work?* (5d, looking **sideways**)
 
-Every dispositioned feature has a row here (story ↔ branch ↔ design). If a row already
-covers this feature, report the existing story and stop.
+Do not crawl every branch — if work is real it is recorded as a Jira story, a TRACKER row,
+or an open PR. But **5d is never skipped**, even when 5a–5c produce a clean hit. A feature
+can be simultaneously half-merged and owned by a different open story; stopping at the
+first hit hides the second, and the story gets triaged into a scope another story already
+covers.
+
+**5a. TRACKER.md — a record, not the truth**
+
+Every dispositioned feature should have a row here (story ↔ branch ↔ design), so it is the
+cheapest place to look. It is **not** authoritative: rows go stale when a PR merges or a
+story is re-scoped in Jira, and nothing enforces write-back.
 
 ```bash
 grep -in "<feature-keyword>\|<ISSUE-KEY>" "<Designs Directory>/TRACKER.md"
 ```
+
+**Every status or title a TRACKER row claims MUST be re-verified before it is repeated or
+acted on.** Check the row's status against Jira, and its branch/PR claim against `gh`:
+
+```bash
+jira issue view <KEY-FROM-ROW> --plain | head -3        # real status and real title
+gh pr list --state all --search "<KEY-FROM-ROW>"        # merged, open, or nonexistent
+```
+
+Three failure modes seen in practice, all in a single session:
+- row says `PR Open` when the PR merged days earlier
+- row says `Implemented & Tested` for work that only ever existed in the frozen crane-lib
+  repo and was never ported (grep the Crane Plugin Repo to confirm before believing it)
+- row's title describes an older scope than the Jira issue's current title
+
+Report every discrepancy found, and never state that a piece of work is untracked on the
+strength of a TRACKER row alone — confirm against Jira first.
 
 **5b. Merged code — is it already in `main`?**
 
@@ -333,7 +364,38 @@ gh pr list --state open --search "<feature-keyword>"
 gh pr list --state open --search "<ISSUE-KEY>"
 ```
 
-If all three come up empty, the feature is not started — triage it as new.
+**5d. Sibling stories — does another open story already own this? (MANDATORY)**
+
+5a–5c only look backwards. This step looks sideways, and is the one that catches an open
+story whose scope overlaps or subsumes the issue being triaged. Run it every time.
+
+List every story in the enhancement epics and search the titles for the feature:
+
+```bash
+for E in <epic keys>; do
+  jira issue list --jql "project = BUILD AND parent = $E" \
+    --plain --no-headers --columns key,summary,status
+done
+```
+
+Then scan that output for the feature keyword AND for the broader behaviour it belongs to —
+a story titled "Always emit a BuildRun template for every converted Build" subsumes a story
+about one field reaching that template, and the keyword alone will not match it. Read the
+description of anything that looks adjacent.
+
+For each overlapping story found, record in the design doc:
+
+| Story | Status | Relationship | Consequence for this issue |
+|---|---|---|---|
+
+Relationship is one of: `subsumes` (the other story's fix makes this one unnecessary),
+`overlaps` (shared work needing a split), `depends-on`, or `blocked-by`.
+
+**An unreported `subsumes` is a BLOCKING error** — it sends someone to build a fix a
+different story already delivers. When one is found, surface it before triage and let the
+user decide which story owns the work.
+
+If 5a–5d all come up empty, the feature is not started and unowned — triage it as new.
 
 ### Phase 6: Feasibility & Necessity (Premise Challenge)
 
@@ -357,7 +419,8 @@ feasibility assessment.
 
 - Check the Jira description for links to Google Docs, GitHub issues, or other external
   references not yet checked
-- Check for related Jira issues that should be grouped or sequenced
+- Re-read the Phase 5d overlap table. Anything marked `subsumes` or `overlaps` must be
+  raised with the user before triage — it changes what this story is for
 - Check whether this issue is a prerequisite for, or blocked by, others in the epic
 - Ask: "Anything else I should check for this issue?"
 
@@ -446,6 +509,16 @@ kebab-case (e.g. `BUILD-1578-no-cache-buildah-strategy.md`).
 - Files checked: <file:line references>
 - Upstream differences: <list each>
 - Operator lag: <in sync / operator behind by: ...>
+
+### Sibling Stories (Phase 5d)
+| Story | Status | Relationship | Consequence for this issue |
+|---|---|---|---|
+| BUILD-XXXX | <status> | subsumes / overlaps / depends-on / blocked-by | <what changes> |
+
+State "none found" explicitly if the epic search returned nothing overlapping.
+
+### TRACKER Discrepancies Found
+- <row N: what it claimed vs what Jira/gh actually say, or "none">
 
 ### Crane Plugin Status
 - Current handling: <warning/partial/none> (confidence: N/10)
@@ -598,6 +671,8 @@ The Escape Hatch does not waive Phase 9 or the Compliance Report.
 | Phase | Status | Evidence / Reason |
 |-------|--------|-------------------|
 | 0–9 (one row each, incl. Phase 4d destination-needs table row count) | ✅ / ⏭️ SKIPPED (reason) / ❌ | |
+| Phase 5d sibling-story search run over all epics | ✅ / ❌ | epics searched + overlaps found (or "none") |
+| TRACKER claims re-verified against Jira/gh | ✅ / ❌ | discrepancies listed, or "none" |
 | Tracker+Jira write-back verified | ✅ / ❌ | grep output |
 
 Any unexplained row forces Completion Status = DONE_WITH_CONCERNS at best.
