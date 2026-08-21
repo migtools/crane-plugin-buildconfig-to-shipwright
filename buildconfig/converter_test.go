@@ -2817,3 +2817,160 @@ func TestConvertRunPolicyWiring(t *testing.T) {
 		})
 	}
 }
+
+// --- BUILD-2269: ServiceAccount association warning -------------------------
+//
+// A ServiceAccount named by the BuildConfig lives on the source cluster and
+// carries secrets, imagePullSecrets and RBAC bindings that the conversion does
+// not migrate. These tests pin the warning that tells the user so, and pin the
+// cases where it must stay silent.
+
+// runSAConversion converts a BuildConfig with the given spec, returning the
+// converted Build's annotations alongside the captured log entries.
+func runSAConversion(t *testing.T, spec map[string]interface{}) (map[string]string, *logrustest.Hook) {
+	t.Helper()
+	logger, hook := logrustest.NewNullLogger()
+	plugin := &BuildConfigTransformPlugin{Log: logger}
+	request := transform.PluginRequest{
+		Unstructured: unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "build.openshift.io/v1",
+			"kind":       "BuildConfig",
+			"metadata": map[string]interface{}{
+				"name":      "myapp",
+				"namespace": "myns",
+			},
+			"spec": spec,
+		}},
+	}
+	resp, err := plugin.Run(request)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.NewResources) < 1 {
+		t.Fatal("expected at least 1 new resource")
+	}
+	return resp.NewResources[0].GetAnnotations(), hook
+}
+
+func logMessages(hook *logrustest.Hook, level logrus.Level, substr string) []string {
+	var out []string
+	for _, entry := range hook.AllEntries() {
+		if entry.Level == level && strings.Contains(entry.Message, substr) {
+			out = append(out, entry.Message)
+		}
+	}
+	return out
+}
+
+// saSpec builds a minimal convertible Source-strategy BuildConfig spec, then
+// applies the given overrides.
+func saSpec(overrides map[string]interface{}) map[string]interface{} {
+	spec := map[string]interface{}{
+		"source": map[string]interface{}{
+			"type": "Git",
+			"git":  map[string]interface{}{"uri": "https://github.com/example/myapp.git"},
+		},
+		"strategy": map[string]interface{}{
+			"type": "Source",
+			"sourceStrategy": map[string]interface{}{
+				"from": map[string]interface{}{
+					"kind": "DockerImage",
+					"name": "registry.example.com/builder:latest",
+				},
+			},
+		},
+		"output": map[string]interface{}{
+			"to": map[string]interface{}{"kind": "DockerImage", "name": "quay.io/example/myapp:latest"},
+		},
+	}
+	for k, v := range overrides {
+		spec[k] = v
+	}
+	return spec
+}
+
+func TestServiceAccountAssociationWarned(t *testing.T) {
+	_, hook := runSAConversion(t, saSpec(map[string]interface{}{
+		"serviceAccount": "custom-builder-sa",
+	}))
+
+	warnings := logMessages(hook, logrus.WarnLevel, "may carry additional secrets")
+	if len(warnings) != 1 {
+		t.Fatalf("expected exactly 1 ServiceAccount association warning, got %d: %v", len(warnings), warnings)
+	}
+	for _, want := range []string{`"custom-builder-sa"`, "myns/myapp", "imagePullSecrets", "RBAC bindings", "target cluster"} {
+		if !strings.Contains(warnings[0], want) {
+			t.Errorf("warning missing %q: %s", want, warnings[0])
+		}
+	}
+}
+
+func TestServiceAccountAssociationNotWarnedWhenUnset(t *testing.T) {
+	// No spec.serviceAccount means nothing was configured on the source
+	// cluster, so there are no associations to carry over and no warning.
+	_, hook := runSAConversion(t, saSpec(nil))
+
+	if warnings := logMessages(hook, logrus.WarnLevel, "may carry additional secrets"); len(warnings) != 0 {
+		t.Errorf("expected no ServiceAccount association warning, got: %v", warnings)
+	}
+}
+
+func TestServiceAccountAssociationNotWarnedForGeneratedSA(t *testing.T) {
+	// A pull secret makes the converter generate a ServiceAccount of its own.
+	// That one is built here and carries only the pull secret, so there is no
+	// source-cluster ServiceAccount whose associations could have been lost.
+	_, hook := runSAConversion(t, saSpec(map[string]interface{}{
+		"strategy": map[string]interface{}{
+			"type": "Source",
+			"sourceStrategy": map[string]interface{}{
+				"from": map[string]interface{}{
+					"kind": "DockerImage",
+					"name": "registry.example.com/builder:latest",
+				},
+				"pullSecret": map[string]interface{}{"name": "my-pull-secret"},
+			},
+		},
+	}))
+
+	if warnings := logMessages(hook, logrus.WarnLevel, "may carry additional secrets"); len(warnings) != 0 {
+		t.Errorf("expected no association warning for a converter-generated ServiceAccount, got: %v", warnings)
+	}
+}
+
+func TestServiceAccountMappedToTemplateLogged(t *testing.T) {
+	// Resources force a BuildRun template to be written, so the INFO reports
+	// which ServiceAccount reached it.
+	annotations, hook := runSAConversion(t, saSpec(map[string]interface{}{
+		"serviceAccount": "custom-builder-sa",
+		"resources": map[string]interface{}{
+			"limits": map[string]interface{}{"memory": "2Gi"},
+		},
+	}))
+
+	if _, ok := annotations[BuildRunTemplateAnnotation]; !ok {
+		t.Fatalf("expected annotation %s, got: %v", BuildRunTemplateAnnotation, annotations)
+	}
+
+	infos := logMessages(hook, logrus.InfoLevel, "Mapped serviceAccount")
+	if len(infos) != 1 {
+		t.Fatalf("expected exactly 1 mapped-serviceAccount info, got %d: %v", len(infos), infos)
+	}
+	for _, want := range []string{`"custom-builder-sa"`, BuildRunTemplateAnnotation, "myns/myapp"} {
+		if !strings.Contains(infos[0], want) {
+			t.Errorf("info missing %q: %s", want, infos[0])
+		}
+	}
+}
+
+func TestServiceAccountMappedNotLoggedWithoutTemplate(t *testing.T) {
+	// No resources means no BuildRun template today, so nothing was mapped and
+	// the INFO must stay silent — while the WARN above still fires. Once
+	// BUILD-2314 always emits a template, this expectation flips to 1.
+	_, hook := runSAConversion(t, saSpec(map[string]interface{}{
+		"serviceAccount": "custom-builder-sa",
+	}))
+
+	if infos := logMessages(hook, logrus.InfoLevel, "Mapped serviceAccount"); len(infos) != 0 {
+		t.Errorf("expected no mapped-serviceAccount info when no template is written, got: %v", infos)
+	}
+}

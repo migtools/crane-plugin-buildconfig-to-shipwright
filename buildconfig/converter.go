@@ -150,6 +150,18 @@ func (c *Converter) Convert(bc *buildv1.BuildConfig) ([]unstructured.Unstructure
 		newResources = append(newResources, saUnstructured)
 	}
 
+	// A ServiceAccount named by the BuildConfig exists on the source cluster and
+	// carries associations this conversion cannot see, let alone migrate: secrets,
+	// imagePullSecrets, RoleBindings/ClusterRoleBindings, and SCC associations.
+	// Crane converts BuildConfigs, not RBAC objects, so those stay behind. Without
+	// this warning the failure surfaces much later and far from its cause — either
+	// the BuildRun runs as the namespace default ServiceAccount and fails on an
+	// image pull or push, or it fails outright with ServiceAccountNotFound.
+	if bc.Spec.ServiceAccount != "" {
+		c.Log.Warnf("The original ServiceAccount %q on BuildConfig %s/%s may carry additional secrets, imagePullSecrets, and RBAC bindings. Verify these associations are available in the target cluster for the Shipwright BuildRun.",
+			bc.Spec.ServiceAccount, bc.Namespace, bc.Name)
+	}
+
 	c.processSource(bc, b)
 	c.processOutput(bc, b)
 	c.processCompletionDeadline(bc, b)
@@ -1070,6 +1082,13 @@ func (c *Converter) processResources(bc *buildv1.BuildConfig, b *shipwrightv1bet
 	}
 
 	b.Annotations[BuildRunTemplateAnnotation] = string(templateYAML)
+
+	// Ahead of the stepNames early return below, so the mapping is reported for
+	// every template written, not only those that also carry stepResources.
+	if spec.ServiceAccount != nil {
+		c.Log.Infof("Mapped serviceAccount %q to BuildRun template in annotation %s for BuildConfig %s/%s",
+			*spec.ServiceAccount, BuildRunTemplateAnnotation, bc.Namespace, bc.Name)
+	}
 
 	if len(stepNames) == 0 {
 		c.Log.Warnf("Build strategy %q is a custom mapping with unknown step names — stepResources were omitted from the BuildRun template in annotation %s. Add stepResources entries matching the strategy's step names to carry over the BuildConfig resource requirements (requests: %v, limits: %v).", b.Spec.Strategy.Name, BuildRunTemplateAnnotation, res.Requests, res.Limits)
