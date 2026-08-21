@@ -33,6 +33,23 @@ All other resource types are passed through unchanged.
 | `insecure-registries` | `reg1,reg2` | Insecure registries for Buildah |
 | `block-registries` | `reg1,reg2` | Blocked registries for Buildah |
 
+## Prerequisites
+
+This plugin requires the [crane CLI](https://github.com/konveyor/crane) to be installed.
+
+### Installing crane
+
+```bash
+# Build from source
+git clone https://github.com/konveyor/crane.git
+cd crane
+go build -o crane .
+sudo mv crane /usr/local/bin/
+
+# Verify installation
+crane version
+```
+
 ## Usage with crane
 
 ### 1. Export the namespace
@@ -192,9 +209,36 @@ Requires Go 1.26+ (forced by transitive dependencies).
 
 ## Testing
 
+The project uses a three-level testing strategy:
+
+### 1. Unit Tests
+Standard Go tests at the method level, testing individual functions and transformation logic.
+
 ```bash
 GOTOOLCHAIN=auto go test ./...
 ```
+
+### 2. Plugin E2E Tests
+Tests the plugin binary in isolation (with crane), processing input YAML manifest files and asserting expected output manifests.
+
+```bash
+# TBD, or WIP ./tests/e2e-transform.sh
+```
+
+These tests verify the transformation logic works correctly without requiring a live cluster.
+
+### 3. Cluster E2E Tests
+Full end-to-end tests on real Kubernetes clusters, validating the entire workflow:
+- **Minikube** - with fake BuildConfig CRD (CRD only, no build functionality)
+- **OpenShift** - with full OpenShift Builds/Shipwright installation
+
+Tests the complete flow: export from cluster → transformation → import → verify Shipwright Builds are valid and functional (trigger actual builds with configured strategies).
+
+```bash
+# TBD
+```
+
+See [`hack/README.md`](hack/README.md) for detailed setup instructions.
 
 ## Known limitations
 
