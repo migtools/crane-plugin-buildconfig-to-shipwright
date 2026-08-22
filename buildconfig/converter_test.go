@@ -2817,3 +2817,210 @@ func TestConvertRunPolicyWiring(t *testing.T) {
 		})
 	}
 }
+
+// TestProcessSourceInlineDockerfile covers BUILD-2275. spec.source.dockerfile holds raw
+// Dockerfile contents, which Shipwright has no field for, so the content cannot be migrated
+// under either strategy: Docker errors, and Source — where the field was previously dropped
+// with no message at all — warns.
+func TestProcessSourceInlineDockerfile(t *testing.T) {
+	inline := "FROM scratch\nCOPY . /app"
+	empty := ""
+
+	tests := []struct {
+		name            string
+		strategyType    buildv1.BuildStrategyType
+		dockerfile      *string
+		wantSourceWarn  bool
+		wantDockerError bool
+	}{
+		{
+			name:           "Source strategy with an inline Dockerfile warns it was not migrated",
+			strategyType:   buildv1.SourceBuildStrategyType,
+			dockerfile:     &inline,
+			wantSourceWarn: true,
+		},
+		{
+			name:         "Source strategy without an inline Dockerfile stays silent",
+			strategyType: buildv1.SourceBuildStrategyType,
+		},
+		{
+			// omitempty on a *string suppresses only a nil pointer, so `dockerfile: ""`
+			// arrives as a non-nil pointer to "". There is no content to lose, and
+			// warning would tell the user to reconfigure a strategy over nothing.
+			name:         "Source strategy with an explicitly empty Dockerfile stays silent",
+			strategyType: buildv1.SourceBuildStrategyType,
+			dockerfile:   &empty,
+		},
+		{
+			name:            "Docker strategy with an inline Dockerfile still errors",
+			strategyType:    buildv1.DockerBuildStrategyType,
+			dockerfile:      &inline,
+			wantDockerError: true,
+		},
+		{
+			name:         "Docker strategy without an inline Dockerfile stays silent",
+			strategyType: buildv1.DockerBuildStrategyType,
+		},
+		{
+			name:         "Docker strategy with an explicitly empty Dockerfile stays silent",
+			strategyType: buildv1.DockerBuildStrategyType,
+			dockerfile:   &empty,
+		},
+		{
+			// Convert() returns before processSource for Custom and JenkinsPipeline, so
+			// those BuildConfigs pass through unchanged and nothing is dropped. Locking
+			// the switch's silence in here means relaxing that early return cannot
+			// quietly reintroduce a silent drop.
+			name:         "Custom strategy falls through the switch without a diagnostic",
+			strategyType: buildv1.CustomBuildStrategyType,
+			dockerfile:   &inline,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, hook := logrustest.NewNullLogger()
+			c := &Converter{Log: logger}
+			bc := &buildv1.BuildConfig{
+				ObjectMeta: metav1.ObjectMeta{Name: "dockerfile-app", Namespace: "myns"},
+				Spec: buildv1.BuildConfigSpec{
+					CommonSpec: buildv1.CommonSpec{
+						Source: buildv1.BuildSource{
+							Dockerfile: tt.dockerfile,
+							Git:        &buildv1.GitBuildSource{URI: "https://example.com/repo.git"},
+						},
+						Strategy: buildv1.BuildStrategy{Type: tt.strategyType},
+					},
+				},
+			}
+
+			c.processSource(bc, &shipwrightv1beta1.Build{})
+
+			var sourceWarn, dockerErr *logrus.Entry
+			var messages []string
+			for _, entry := range hook.AllEntries() {
+				messages = append(messages, entry.Message)
+				if !strings.Contains(entry.Message, "nline Dockerfile") {
+					continue
+				}
+				switch entry.Level {
+				case logrus.WarnLevel:
+					sourceWarn = entry
+				case logrus.ErrorLevel:
+					dockerErr = entry
+				}
+			}
+
+			if (dockerErr != nil) != tt.wantDockerError {
+				t.Errorf("Docker-strategy error emitted = %v, want %v (logged: %q)", dockerErr != nil, tt.wantDockerError, messages)
+			}
+			// Fatal, not Error: the assertions below dereference these entries, so
+			// continuing past a missing log would panic and abort the whole binary.
+			if (sourceWarn != nil) != tt.wantSourceWarn {
+				t.Fatalf("Source-strategy warning emitted = %v, want %v (logged: %q)", sourceWarn != nil, tt.wantSourceWarn, messages)
+			}
+
+			// Both diagnostics must identify the BuildConfig by namespace and name.
+			// Names are unique only within a namespace, so without it a bulk
+			// multi-namespace migration produces unattributable log lines.
+			if tt.wantDockerError && !strings.Contains(dockerErr.Message, "myns/dockerfile-app") {
+				t.Errorf("Docker error = %q, want it to name the BuildConfig as myns/dockerfile-app", dockerErr.Message)
+			}
+			if !tt.wantSourceWarn {
+				return
+			}
+			if !strings.Contains(sourceWarn.Message, "myns/dockerfile-app") {
+				t.Errorf("message = %q, want it to name the BuildConfig as myns/dockerfile-app", sourceWarn.Message)
+			}
+			if !strings.Contains(sourceWarn.Message, "Source-to-Image") {
+				t.Errorf("message = %q, want it to name the strategy that ignores the Dockerfile", sourceWarn.Message)
+			}
+			if !strings.Contains(sourceWarn.Message, "reconfigure the BuildConfig strategy type") {
+				t.Errorf("message = %q, want it to tell the user how to fix the likely misconfiguration", sourceWarn.Message)
+			}
+		})
+	}
+}
+
+// TestConvertInlineDockerfileWiring proves both inline-Dockerfile diagnostics fire during a
+// real conversion, not only when processSource is called directly. Asserting the Docker
+// error here too means a regression that dropped it while still correctly suppressing the
+// Source warning cannot pass unnoticed.
+func TestConvertInlineDockerfileWiring(t *testing.T) {
+	tests := []struct {
+		name      string
+		strategy  map[string]interface{}
+		wantWarn  bool
+		wantError bool
+	}{
+		{
+			name: "Source strategy conversion reports the dropped inline Dockerfile",
+			strategy: map[string]interface{}{
+				"type": "Source",
+				"sourceStrategy": map[string]interface{}{
+					"from": map[string]interface{}{"kind": "DockerImage", "name": "quay.io/example/builder:latest"},
+				},
+			},
+			wantWarn: true,
+		},
+		{
+			name: "Docker strategy conversion errors instead of emitting the Source warning",
+			strategy: map[string]interface{}{
+				"type":           "Docker",
+				"dockerStrategy": map[string]interface{}{},
+			},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, hook := logrustest.NewNullLogger()
+			plugin := &BuildConfigTransformPlugin{Log: logger}
+			request := transform.PluginRequest{
+				Unstructured: unstructured.Unstructured{Object: map[string]interface{}{
+					"apiVersion": "build.openshift.io/v1",
+					"kind":       "BuildConfig",
+					"metadata": map[string]interface{}{
+						"name":      "dockerfile-app",
+						"namespace": "myns",
+					},
+					"spec": map[string]interface{}{
+						"source": map[string]interface{}{
+							"type":       "Git",
+							"git":        map[string]interface{}{"uri": "https://example.com/repo.git"},
+							"dockerfile": "FROM scratch\nCOPY . /app",
+						},
+						"strategy": tt.strategy,
+						"output": map[string]interface{}{
+							"to": map[string]interface{}{"kind": "DockerImage", "name": "quay.io/example/app:latest"},
+						},
+					},
+				}},
+			}
+
+			if _, err := plugin.Run(request); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			gotWarn, gotError := false, false
+			for _, entry := range hook.AllEntries() {
+				if !strings.Contains(entry.Message, "nline Dockerfile") {
+					continue
+				}
+				switch entry.Level {
+				case logrus.WarnLevel:
+					gotWarn = true
+				case logrus.ErrorLevel:
+					gotError = true
+				}
+			}
+			if gotWarn != tt.wantWarn {
+				t.Errorf("Source-strategy warning emitted = %v, want %v", gotWarn, tt.wantWarn)
+			}
+			if gotError != tt.wantError {
+				t.Errorf("Docker-strategy error emitted = %v, want %v", gotError, tt.wantError)
+			}
+		})
+	}
+}
