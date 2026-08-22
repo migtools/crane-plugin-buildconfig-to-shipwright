@@ -1465,35 +1465,65 @@ func TestProcessCompletionDeadline(t *testing.T) {
 	}
 }
 
-func TestProcessSuccessfulBuildsHistoryLimit(t *testing.T) {
+// retentionLimitField describes one BuildConfig build-history limit and the
+// Shipwright retention field it maps to, so both mappings run the same cases.
+type retentionLimitField struct {
+	bcField    string
+	swField    string
+	setLimit   func(*buildv1.BuildConfigSpec, *int32)
+	getLimit   func(*shipwrightv1beta1.BuildRetention) *uint
+	getSibling func(*shipwrightv1beta1.BuildRetention) *uint
+	setSibling func(*shipwrightv1beta1.BuildRetention, *uint)
+}
+
+func TestProcessBuildsHistoryLimits(t *testing.T) {
 	uintPtr := func(v uint) *uint { return &v }
 	int32Ptr := func(v int32) *int32 { return &v }
 
+	fields := []retentionLimitField{
+		{
+			bcField:    "successfulBuildsHistoryLimit",
+			swField:    "succeededLimit",
+			setLimit:   func(s *buildv1.BuildConfigSpec, v *int32) { s.SuccessfulBuildsHistoryLimit = v },
+			getLimit:   func(r *shipwrightv1beta1.BuildRetention) *uint { return r.SucceededLimit },
+			getSibling: func(r *shipwrightv1beta1.BuildRetention) *uint { return r.FailedLimit },
+			setSibling: func(r *shipwrightv1beta1.BuildRetention, v *uint) { r.FailedLimit = v },
+		},
+		{
+			bcField:    "failedBuildsHistoryLimit",
+			swField:    "failedLimit",
+			setLimit:   func(s *buildv1.BuildConfigSpec, v *int32) { s.FailedBuildsHistoryLimit = v },
+			getLimit:   func(r *shipwrightv1beta1.BuildRetention) *uint { return r.FailedLimit },
+			getSibling: func(r *shipwrightv1beta1.BuildRetention) *uint { return r.SucceededLimit },
+			setSibling: func(r *shipwrightv1beta1.BuildRetention, v *uint) { r.SucceededLimit = v },
+		},
+	}
+
 	tests := []struct {
-		name              string
-		limit             *int32
-		preexisting       *shipwrightv1beta1.BuildRetention
-		expectedSucceeded *uint
-		expectWarning     bool
+		name               string
+		limit              *int32
+		preexistingSibling bool
+		expected           *uint
+		expectWarning      bool
 	}{
 		{
-			name:  "successfulBuildsHistoryLimit unset leaves retention nil",
+			name:  "limit unset leaves retention nil",
 			limit: nil,
 		},
 		{
-			name:              "lower CRD boundary 1 maps to retention.succeededLimit",
-			limit:             int32Ptr(1),
-			expectedSucceeded: uintPtr(1),
+			name:     "lower CRD boundary 1 maps to retention",
+			limit:    int32Ptr(1),
+			expected: uintPtr(1),
 		},
 		{
-			name:              "typical value maps to retention.succeededLimit",
-			limit:             int32Ptr(5),
-			expectedSucceeded: uintPtr(5),
+			name:     "typical value maps to retention",
+			limit:    int32Ptr(5),
+			expected: uintPtr(5),
 		},
 		{
-			name:              "upper CRD boundary 10000 maps to retention.succeededLimit",
-			limit:             int32Ptr(10000),
-			expectedSucceeded: uintPtr(10000),
+			name:     "upper CRD boundary 10000 maps to retention",
+			limit:    int32Ptr(10000),
+			expected: uintPtr(10000),
 		},
 		{
 			name:          "zero is warned and dropped (Shipwright CRD Minimum=1)",
@@ -1511,74 +1541,147 @@ func TestProcessSuccessfulBuildsHistoryLimit(t *testing.T) {
 			expectWarning: true,
 		},
 		{
-			name:              "pre-existing retention block is updated, not replaced",
-			limit:             int32Ptr(5),
-			preexisting:       &shipwrightv1beta1.BuildRetention{FailedLimit: uintPtr(3)},
-			expectedSucceeded: uintPtr(5),
+			name:               "pre-existing retention block is updated, not replaced",
+			limit:              int32Ptr(5),
+			preexistingSibling: true,
+			expected:           uintPtr(5),
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			logger, hook := logrustest.NewNullLogger()
-			c := &Converter{Log: logger}
-			bc := &buildv1.BuildConfig{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "history-app",
-					Namespace: "default",
-				},
-				Spec: buildv1.BuildConfigSpec{
-					SuccessfulBuildsHistoryLimit: tt.limit,
-				},
-			}
-			b := &shipwrightv1beta1.Build{}
-			if tt.preexisting != nil {
-				b.Spec.Retention = tt.preexisting
-			}
+	for _, tf := range fields {
+		t.Run(tf.bcField, func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					logger, hook := logrustest.NewNullLogger()
+					c := &Converter{Log: logger}
+					bc := &buildv1.BuildConfig{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "history-app",
+							Namespace: "default",
+						},
+					}
+					tf.setLimit(&bc.Spec, tt.limit)
 
-			c.processSuccessfulBuildsHistoryLimit(bc, b)
+					b := &shipwrightv1beta1.Build{}
+					var preexisting *shipwrightv1beta1.BuildRetention
+					if tt.preexistingSibling {
+						preexisting = &shipwrightv1beta1.BuildRetention{}
+						tf.setSibling(preexisting, uintPtr(3))
+						b.Spec.Retention = preexisting
+					}
 
-			var warnings []string
-			for _, entry := range hook.AllEntries() {
-				if entry.Level == logrus.WarnLevel && strings.Contains(entry.Message, "successfulBuildsHistoryLimit") {
-					warnings = append(warnings, entry.Message)
-				}
-			}
-			if tt.expectWarning {
-				if len(warnings) != 1 {
-					t.Fatalf("expected exactly 1 warning, got %d: %v", len(warnings), warnings)
-				}
-				if !strings.Contains(warnings[0], "history-app") {
-					t.Errorf("warning does not name the BuildConfig: %q", warnings[0])
-				}
-			} else if len(warnings) != 0 {
-				t.Fatalf("expected no warnings, got: %v", warnings)
-			}
+					c.processBuildsHistoryLimits(bc, b)
 
-			if tt.expectedSucceeded == nil {
-				if tt.preexisting == nil && b.Spec.Retention != nil {
-					t.Fatalf("expected retention to stay nil, got %+v", b.Spec.Retention)
-				}
-				if b.Spec.Retention != nil && b.Spec.Retention.SucceededLimit != nil {
-					t.Fatalf("expected succeededLimit to stay unset, got %d", *b.Spec.Retention.SucceededLimit)
-				}
-				return
-			}
-			if b.Spec.Retention == nil || b.Spec.Retention.SucceededLimit == nil {
-				t.Fatalf("expected retention.succeededLimit to be set, got %+v", b.Spec.Retention)
-			}
-			if *b.Spec.Retention.SucceededLimit != *tt.expectedSucceeded {
-				t.Errorf("succeededLimit = %d, want %d", *b.Spec.Retention.SucceededLimit, *tt.expectedSucceeded)
-			}
-			if tt.preexisting != nil {
-				if b.Spec.Retention != tt.preexisting {
-					t.Error("pre-existing retention block was replaced instead of updated")
-				}
-				if b.Spec.Retention.FailedLimit == nil || *b.Spec.Retention.FailedLimit != 3 {
-					t.Errorf("pre-existing failedLimit was clobbered: %+v", b.Spec.Retention.FailedLimit)
-				}
+					var warnings []string
+					for _, entry := range hook.AllEntries() {
+						if entry.Level == logrus.WarnLevel && strings.Contains(entry.Message, tf.bcField) {
+							warnings = append(warnings, entry.Message)
+						}
+					}
+					if tt.expectWarning {
+						if len(warnings) != 1 {
+							t.Fatalf("expected exactly 1 warning, got %d: %v", len(warnings), warnings)
+						}
+						if !strings.Contains(warnings[0], "history-app") {
+							t.Errorf("warning does not name the BuildConfig: %q", warnings[0])
+						}
+					} else if len(warnings) != 0 {
+						t.Fatalf("expected no warnings, got: %v", warnings)
+					}
+
+					if tt.expected == nil {
+						if preexisting == nil && b.Spec.Retention != nil {
+							t.Fatalf("expected retention to stay nil, got %+v", b.Spec.Retention)
+						}
+						if b.Spec.Retention != nil && tf.getLimit(b.Spec.Retention) != nil {
+							t.Fatalf("expected %s to stay unset, got %d", tf.swField, *tf.getLimit(b.Spec.Retention))
+						}
+						return
+					}
+					if b.Spec.Retention == nil || tf.getLimit(b.Spec.Retention) == nil {
+						t.Fatalf("expected retention.%s to be set, got %+v", tf.swField, b.Spec.Retention)
+					}
+					if *tf.getLimit(b.Spec.Retention) != *tt.expected {
+						t.Errorf("%s = %d, want %d", tf.swField, *tf.getLimit(b.Spec.Retention), *tt.expected)
+					}
+					if preexisting != nil {
+						if b.Spec.Retention != preexisting {
+							t.Error("pre-existing retention block was replaced instead of updated")
+						}
+						if got := tf.getSibling(b.Spec.Retention); got == nil || *got != 3 {
+							t.Errorf("pre-existing sibling limit was clobbered: %+v", got)
+						}
+					}
+				})
 			}
 		})
+	}
+}
+
+// TestConvertMapsBuildsHistoryLimits is an end-to-end guard that both
+// history-limit mappings are actually wired into Convert(): the table test
+// above calls processBuildsHistoryLimits directly and so cannot catch a
+// missing call site.
+func TestConvertMapsBuildsHistoryLimits(t *testing.T) {
+	plugin := &BuildConfigTransformPlugin{Log: logrus.New()}
+	request := transform.PluginRequest{
+		Unstructured: unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "build.openshift.io/v1",
+			"kind":       "BuildConfig",
+			"metadata": map[string]interface{}{
+				"name":      "myapp-build",
+				"namespace": "myns",
+			},
+			"spec": map[string]interface{}{
+				"successfulBuildsHistoryLimit": int64(7),
+				"failedBuildsHistoryLimit":     int64(4),
+				"source": map[string]interface{}{
+					"type": "Git",
+					"git": map[string]interface{}{
+						"uri": "https://github.com/example/myapp.git",
+					},
+				},
+				"strategy": map[string]interface{}{
+					"type": "Docker",
+					"dockerStrategy": map[string]interface{}{
+						"dockerfilePath": "Dockerfile",
+					},
+				},
+				"output": map[string]interface{}{
+					"to": map[string]interface{}{
+						"kind": "DockerImage",
+						"name": "quay.io/example/myapp:latest",
+					},
+				},
+			},
+		}},
+	}
+
+	resp, err := plugin.Run(request)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.NewResources) < 1 {
+		t.Fatal("expected at least 1 new resource")
+	}
+
+	b := &shipwrightv1beta1.Build{}
+	jsonBytes, err := json.Marshal(resp.NewResources[0].Object)
+	if err != nil {
+		t.Fatalf("marshalling converted Build: %v", err)
+	}
+	if err := json.Unmarshal(jsonBytes, b); err != nil {
+		t.Fatalf("unmarshalling converted Build: %v", err)
+	}
+
+	if b.Spec.Retention == nil {
+		t.Fatal("expected retention to be set end-to-end, got nil")
+	}
+	if b.Spec.Retention.SucceededLimit == nil || *b.Spec.Retention.SucceededLimit != 7 {
+		t.Errorf("succeededLimit = %v, want 7", b.Spec.Retention.SucceededLimit)
+	}
+	if b.Spec.Retention.FailedLimit == nil || *b.Spec.Retention.FailedLimit != 4 {
+		t.Errorf("failedLimit = %v, want 4", b.Spec.Retention.FailedLimit)
 	}
 }
 
