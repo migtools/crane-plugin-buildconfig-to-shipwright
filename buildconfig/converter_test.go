@@ -1653,48 +1653,83 @@ func TestConvertNoOutputImage(t *testing.T) {
 	}
 }
 
-func labelsTestRequest(name string, labels map[string]interface{}) transform.PluginRequest {
+// buildConfigRequest builds a PluginRequest for a minimal Docker-strategy
+// BuildConfig. Every conversion test needs this same source/strategy/output
+// skeleton and varies one field, so the skeleton is declared once here and
+// specialised through options rather than copied per concern.
+func buildConfigRequest(name string, opts ...bcOption) transform.PluginRequest {
 	metadata := map[string]interface{}{
 		"name":      name,
 		"namespace": "myns",
 	}
-	if labels != nil {
-		metadata["labels"] = labels
+	spec := map[string]interface{}{
+		"source": map[string]interface{}{
+			"type": "Git",
+			"git": map[string]interface{}{
+				"uri": "https://github.com/example/myapp.git",
+			},
+		},
+		"strategy": map[string]interface{}{
+			"type":           "Docker",
+			"dockerStrategy": map[string]interface{}{},
+		},
+		"output": map[string]interface{}{
+			"to": map[string]interface{}{
+				"kind": "DockerImage",
+				"name": "quay.io/example/myapp:latest",
+			},
+		},
 	}
+	for _, opt := range opts {
+		opt(metadata, spec)
+	}
+
 	return transform.PluginRequest{
 		Unstructured: unstructured.Unstructured{Object: map[string]interface{}{
 			"apiVersion": "build.openshift.io/v1",
 			"kind":       "BuildConfig",
 			"metadata":   metadata,
-			"spec": map[string]interface{}{
-				"source": map[string]interface{}{
-					"type": "Git",
-					"git": map[string]interface{}{
-						"uri": "https://github.com/example/myapp.git",
-					},
-				},
-				"strategy": map[string]interface{}{
-					"type":           "Docker",
-					"dockerStrategy": map[string]interface{}{},
-				},
-				"output": map[string]interface{}{
-					"to": map[string]interface{}{
-						"kind": "DockerImage",
-						"name": "quay.io/example/myapp:latest",
-					},
-				},
-			},
+			"spec":       spec,
 		}},
+	}
+}
+
+// bcOption specialises the skeleton built by buildConfigRequest.
+type bcOption func(metadata, spec map[string]interface{})
+
+// withLabels sets metadata.labels. A nil map leaves the field absent, which is
+// distinct from setting an empty one.
+func withLabels(labels map[string]interface{}) bcOption {
+	return func(metadata, _ map[string]interface{}) {
+		if labels != nil {
+			metadata["labels"] = labels
+		}
+	}
+}
+
+// withBuildArgs sets spec.strategy.dockerStrategy.buildArgs.
+func withBuildArgs(buildArgs []interface{}) bcOption {
+	return func(_, spec map[string]interface{}) {
+		docker := spec["strategy"].(map[string]interface{})["dockerStrategy"].(map[string]interface{})
+		docker["buildArgs"] = buildArgs
+	}
+}
+
+// withSpecField sets a top-level spec field, covering the BuildConfig fields
+// that need no more shaping than that.
+func withSpecField(key string, value interface{}) bcOption {
+	return func(_, spec map[string]interface{}) {
+		spec[key] = value
 	}
 }
 
 func TestConvertMetadataLabelsCopied(t *testing.T) {
 	plugin := &BuildConfigTransformPlugin{Log: logrus.New()}
-	request := labelsTestRequest("labeled-app", map[string]interface{}{
+	request := buildConfigRequest("labeled-app", withLabels(map[string]interface{}{
 		"app.kubernetes.io/name":    "myapp",
 		"app.kubernetes.io/version": "1.2.3",
 		"team":                      "builds",
-	})
+	}))
 
 	resp, err := plugin.Run(request)
 	if err != nil {
@@ -1723,13 +1758,13 @@ func TestConvertMetadataLabelsCopied(t *testing.T) {
 func TestConvertMetadataLabelsFiltersInternal(t *testing.T) {
 	logger, hook := logrustest.NewNullLogger()
 	plugin := &BuildConfigTransformPlugin{Log: logger}
-	request := labelsTestRequest("internal-labels-app", map[string]interface{}{
+	request := buildConfigRequest("internal-labels-app", withLabels(map[string]interface{}{
 		"openshift.io/build-config.name":  "internal-labels-app",
 		"openshift.io/build.name":         "internal-labels-app-1",
 		"openshift.io/build.start-policy": "Serial",
 		"buildconfig":                     "internal-labels-app",
 		"app.kubernetes.io/name":          "myapp",
-	})
+	}))
 
 	resp, err := plugin.Run(request)
 	if err != nil {
@@ -1759,7 +1794,7 @@ func TestConvertMetadataLabelsAbsent(t *testing.T) {
 	plugin := &BuildConfigTransformPlugin{Log: logrus.New()}
 
 	// No labels at all
-	resp, err := plugin.Run(labelsTestRequest("no-labels-app", nil))
+	resp, err := plugin.Run(buildConfigRequest("no-labels-app", withLabels(nil)))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1771,10 +1806,10 @@ func TestConvertMetadataLabelsAbsent(t *testing.T) {
 	}
 
 	// Only internal labels — everything filtered, labels must be omitted entirely
-	resp, err = plugin.Run(labelsTestRequest("only-internal-app", map[string]interface{}{
+	resp, err = plugin.Run(buildConfigRequest("only-internal-app", withLabels(map[string]interface{}{
 		"openshift.io/build-config.name": "only-internal-app",
 		"buildconfig":                    "only-internal-app",
-	}))
+	})))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2250,39 +2285,6 @@ func TestGenerateServiceAccountWarnsOnSharedServiceAccount(t *testing.T) {
 	}
 }
 
-func buildArgsRequest(buildArgs []interface{}) transform.PluginRequest {
-	return transform.PluginRequest{
-		Unstructured: unstructured.Unstructured{Object: map[string]interface{}{
-			"apiVersion": "build.openshift.io/v1",
-			"kind":       "BuildConfig",
-			"metadata": map[string]interface{}{
-				"name":      "buildargs-test",
-				"namespace": "myns",
-			},
-			"spec": map[string]interface{}{
-				"source": map[string]interface{}{
-					"type": "Git",
-					"git": map[string]interface{}{
-						"uri": "https://github.com/example/myapp.git",
-					},
-				},
-				"strategy": map[string]interface{}{
-					"type": "Docker",
-					"dockerStrategy": map[string]interface{}{
-						"buildArgs": buildArgs,
-					},
-				},
-				"output": map[string]interface{}{
-					"to": map[string]interface{}{
-						"kind": "DockerImage",
-						"name": "quay.io/example/myapp:latest",
-					},
-				},
-			},
-		}},
-	}
-}
-
 func findBuildArgsParam(b *shipwrightv1beta1.Build) *shipwrightv1beta1.ParamValue {
 	for i := range b.Spec.ParamValues {
 		if b.Spec.ParamValues[i].Name == "build-args" {
@@ -2504,7 +2506,7 @@ func TestConvertBuildArgsValueFrom(t *testing.T) {
 			logger, hook := logrustest.NewNullLogger()
 			plugin := &BuildConfigTransformPlugin{Log: logger}
 
-			resp, err := plugin.Run(buildArgsRequest(tt.buildArgs))
+			resp, err := plugin.Run(buildConfigRequest("buildargs-test", withBuildArgs(tt.buildArgs)))
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -2628,7 +2630,7 @@ func TestConvertBuildArgsWarningsAnnotationBounded(t *testing.T) {
 			logger, hook := logrustest.NewNullLogger()
 			plugin := &BuildConfigTransformPlugin{Log: logger}
 
-			resp, err := plugin.Run(buildArgsRequest(tt.buildArgs))
+			resp, err := plugin.Run(buildConfigRequest("buildargs-test", withBuildArgs(tt.buildArgs)))
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
