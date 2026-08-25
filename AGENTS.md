@@ -21,6 +21,7 @@ The plugin fits into crane's multi-stage transform pipeline. For each resource i
 1. If the resource is not a `BuildConfig` (apiGroup `build.openshift.io`), it is passed through unchanged.
 2. If it is a BuildConfig, the plugin returns `IsWhiteOut: true` (marks the original for deletion) and generates a new Shipwright `Build` resource via `NewResources`.
 3. Docker strategy maps to `buildah` ClusterBuildStrategy, Source (S2I) strategy maps to `source-to-image`.
+4. The emitted strategy params are checked against the bundled catalog strategies (`buildconfig/strategies/`, `buildconfig/paramschema.go`). A mismatch is a warning, never an error.
 
 ## ImageStream resolution
 

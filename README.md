@@ -22,6 +22,29 @@ All other resource types are passed through unchanged.
 | Custom | — | Error (no equivalent) |
 | JenkinsPipeline | — | Error (migrate to Tekton) |
 
+### Strategy parameter validation
+
+Every `spec.paramValues` entry the converter emits is checked against a bundled
+copy of the catalog's `buildah` and `source-to-image` ClusterBuildStrategies
+(`buildconfig/strategies/`, taken from
+[strategy-catalog](https://github.com/redhat-openshift-builds/strategy-catalog)
+at the commit in `StrategyCatalogRef`, `buildconfig/paramschema.go`). The check
+is keyed by strategy name and knows nothing about the target cluster: a
+strategy named `buildah` there that differs from the bundled one (an older
+Builds operator, or upstream Shipwright's sample strategies) is not detected.
+
+A param the bundled strategy does not declare, a value of the wrong type, or a
+required param with no value produces a warning that names the reason the
+cluster would report (`UndefinedParameter`, `WrongParameterValueType`,
+`MissingParameterValues`). The Build is still emitted. When
+`default-build-strategy` points at a name with no bundled copy, one warning
+(`NoBundledSchema`) lists the params and types that strategy must declare.
+
+After the catalog changes, refresh the bundle with
+`hack/update-strategy-schemas.sh <commit>`. CI runs
+`hack/update-strategy-schemas.sh --check` as its own job and fails when the
+bundle differs from the pinned commit or from the catalog's `main`.
+
 ## Plugin flags
 
 | Flag | Format | Purpose |

@@ -97,6 +97,24 @@ Creates a Minikube cluster with Shipwright Build for testing.
 ./hack/setup-minikube-shipwright.sh --skip-cluster-create
 ```
 
+### `update-strategy-schemas.sh`
+
+Keeps `buildconfig/strategies/` (the ClusterBuildStrategy copies the converter
+validates params against) in sync with
+[strategy-catalog](https://github.com/redhat-openshift-builds/strategy-catalog).
+
+```bash
+# Refresh the bundle at a catalog commit and rewrite StrategyCatalogRef
+./hack/update-strategy-schemas.sh 6e40b96
+
+# What CI runs: diff the bundle against the pinned commit and against main
+./hack/update-strategy-schemas.sh --check
+```
+
+`--check` exits 1 when either comparison differs (the diff says which) and 2
+when a catalog file could not be fetched. `STRATEGY_CATALOG_RAW` points it at a
+mirror or a `file://` tree.
+
 ## Cleanup
 
 To remove the Minikube cluster:

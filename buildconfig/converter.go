@@ -202,6 +202,8 @@ func (c *Converter) Convert(bc *buildv1.BuildConfig) ([]unstructured.Unstructure
 		return nil, outcomeFailed(err.Error())
 	}
 
+	c.validateStrategyParams(bc, b)
+
 	// Classify the outcome now that every field has been processed, and record
 	// it on the Build so the disposition is observable in the output (BUILD-2318).
 	outcome := outcomeConverted()
@@ -1177,6 +1179,48 @@ func (c *Converter) addRegistries(b *shipwrightv1beta1.Build) {
 			Name:   "registries-block",
 			Values: toSingleValues(c.Opts.BlockRegistries),
 		})
+	}
+}
+
+// validateStrategyParams checks the Build's paramValues against the bundled
+// ClusterBuildStrategy the Build points at, so a param the cluster would reject
+// at registration (UndefinedParameter, WrongParameterValueType) or a required
+// param every BuildRun would fail on (MissingParameterValues) is reported here,
+// next to its cause. It only warns: the Build is still emitted, because a
+// missing value is one edit away from working (BUILD-2317, D-4). It runs once,
+// after every emission site, so addRegistries and any future site are covered.
+func (c *Converter) validateStrategyParams(bc *buildv1.BuildConfig, b *shipwrightv1beta1.Build) {
+	strategy := b.Spec.Strategy.Name
+	defs, ok := loadStrategySchemas()[strategy]
+	if !ok {
+		// A --default-build-strategy override names a strategy this plugin has
+		// no schema for. Nothing can be checked offline, so hand the user the
+		// list their strategy must declare rather than staying quiet.
+		names := make([]string, 0, len(b.Spec.ParamValues))
+		for _, pv := range b.Spec.ParamValues {
+			if pv.Values != nil {
+				names = append(names, pv.Name+" (array)")
+			} else {
+				names = append(names, pv.Name)
+			}
+		}
+		declared := strings.Join(names, ", ")
+		if declared == "" {
+			declared = "(no params were emitted for this Build)"
+		}
+		c.warnf("Strategy params for BuildConfig %s/%s were not validated: no schema is bundled for ClusterBuildStrategy %q (reason: NoBundledSchema). Make sure it declares: %s.", bc.Namespace, bc.Name, strategy, declared)
+		return
+	}
+
+	findings := validateParamValues(defs, b.Spec.ParamValues)
+	if len(findings.Undefined) > 0 {
+		c.warnf("ClusterBuildStrategy %q does not declare param(s) %s emitted for BuildConfig %s/%s; Shipwright will refuse to register the Build (reason: UndefinedParameter). Bundled schema: strategy-catalog@%s.", strategy, strings.Join(findings.Undefined, ", "), bc.Namespace, bc.Name, StrategyCatalogRef)
+	}
+	if len(findings.WrongType) > 0 {
+		c.warnf("Param(s) %s for BuildConfig %s/%s have the wrong value type for ClusterBuildStrategy %q (a string given an array, or an array given a string); Shipwright will refuse to register the Build (reason: WrongParameterValueType).", strings.Join(findings.WrongType, ", "), bc.Namespace, bc.Name, strategy)
+	}
+	if len(findings.Missing) > 0 {
+		c.warnf("ClusterBuildStrategy %q requires param(s) %s that the conversion of BuildConfig %s/%s did not set; a BuildRun will fail (reason: MissingParameterValues) until the Build's or the BuildRun's spec.paramValues supplies a value.", strategy, strings.Join(findings.Missing, ", "), bc.Namespace, bc.Name)
 	}
 }
 

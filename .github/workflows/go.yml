@@ -74,3 +74,15 @@ jobs:
             echo "::error::Coverage ${COVERAGE}% is below ${THRESHOLD}% threshold"
             exit 1
           fi
+
+  strategy-bundle:
+    name: Strategy bundle matches strategy-catalog
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Check strategy bundle against strategy-catalog
+        run: hack/update-strategy-schemas.sh --check
