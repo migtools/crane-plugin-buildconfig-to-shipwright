@@ -1,0 +1,80 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: buildconfig-test
+---
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: ruby-hello-world
+  namespace: buildconfig-test
+spec:
+  lookupPolicy:
+    local: false
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: ruby-hello-world-docker
+  namespace: buildconfig-test
+  labels:
+    app: ruby-hello-world
+    build-type: docker
+spec:
+  source:
+    git:
+      uri: https://github.com/openshift/ruby-hello-world.git
+      ref: master
+    type: Git
+  strategy:
+    dockerStrategy:
+      dockerfilePath: Dockerfile
+    type: Docker
+  output:
+    to:
+      kind: ImageStreamTag
+      name: ruby-hello-world:latest
+  triggers:
+    - type: ConfigChange
+---
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: s2i-ruby-app
+  namespace: buildconfig-test
+spec:
+  lookupPolicy:
+    local: false
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: s2i-ruby-app
+  namespace: buildconfig-test
+  labels:
+    app: s2i-ruby-app
+    build-type: s2i
+spec:
+  source:
+    git:
+      uri: https://github.com/sclorg/ruby-ex.git
+    type: Git
+  strategy:
+    sourceStrategy:
+      from:
+        kind: DockerImage
+        name: 'quay.io/centos7/ruby-27-centos7:latest'
+      env:
+        - name: RACK_ENV
+          value: production
+        - name: RAILS_ENV
+          value: production
+    type: Source
+  output:
+    to:
+      kind: ImageStreamTag
+      name: s2i-ruby-app:latest
+  triggers:
+    - type: ConfigChange
+    - type: ImageChange
