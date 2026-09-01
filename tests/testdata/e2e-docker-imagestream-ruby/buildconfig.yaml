@@ -1,0 +1,28 @@
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: ruby-hello-world-docker
+  namespace: buildconfig-test
+  labels:
+    app: ruby-hello-world
+    build-type: docker
+spec:
+  # Docker strategy (BC-014) — maps to a buildah ClusterBuildStrategy. The
+  # dockerfilePath becomes the "dockerfile" paramValue on the Shipwright Build.
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile
+  source:
+    type: Git
+    git:
+      uri: https://github.com/openshift/ruby-hello-world.git
+      ref: master
+  # ImageStreamTag output target — resolved to the in-cluster registry via
+  # --registry-mapping during transform.
+  output:
+    to:
+      kind: ImageStreamTag
+      name: ruby-hello-world:latest
+  triggers:
+    - type: ConfigChange

@@ -3,10 +3,12 @@ package buildconfig
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/konveyor/crane-lib/transform"
 	buildv1 "github.com/openshift/api/build/v1"
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 const PluginVersion = "v0.1.0"
@@ -36,7 +38,7 @@ func (p *BuildConfigTransformPlugin) Metadata() transform.PluginMetadata {
 			},
 			{
 				FlagName: ImageStreamMappingFlag,
-				Help:     "Map of ImageStreamTag references to concrete image URLs, format: namespace/name:tag=registry/image:tag",
+				Help:     "Map of ImageStreamTag or ImageStreamImage references, and bare DockerImage names that relied on ImageStream lookupPolicy.local, to concrete image URLs, format: namespace/name:tag=registry/image:tag (digest form: namespace/name@sha256:...=...)",
 				Example:  "myns/mystream:latest=quay.io/myorg/myimage:latest",
 			},
 			{
@@ -51,7 +53,7 @@ func (p *BuildConfigTransformPlugin) Metadata() transform.PluginMetadata {
 			},
 			{
 				FlagName: InsecureRegistriesFlag,
-				Help:     "Comma-separated list of insecure registries for Buildah",
+				Help:     "Comma-separated list of insecure (HTTP/self-signed) registries. For a strategy-managed push (buildah) these become the registries-insecure param; for a Shipwright-managed push (source-to-image) an output image on one of these registries sets spec.output.insecure=true",
 				Example:  "my-registry.local:5000",
 			},
 			{
@@ -106,10 +108,10 @@ func (p *BuildConfigTransformPlugin) Run(request transform.PluginRequest) (trans
 		// BuildConfig that fails to convert must not return one. Leave it
 		// unchanged and let the rest of the run continue (BUILD-2318).
 		p.log().Errorf("BuildConfig %s/%s failed to convert (%s) — leaving it unchanged so the rest of the migration can continue", bc.Namespace, bc.Name, outcome.Reason)
-		return passThrough, nil
+		return p.passThroughWithDisposition(u, outcome, passThrough), nil
 	case OutcomeSkipped:
 		p.log().Warnf("BuildConfig %s/%s was not converted (%s) — passing through unchanged", bc.Namespace, bc.Name, outcome.Reason)
-		return passThrough, nil
+		return p.passThroughWithDisposition(u, outcome, passThrough), nil
 	case OutcomeConverted, OutcomeConvertedWithWarnings:
 		p.log().Infof("BuildConfig %s/%s conversion outcome: %s", bc.Namespace, bc.Name, outcome.State)
 		return transform.PluginResponse{
@@ -124,6 +126,22 @@ func (p *BuildConfigTransformPlugin) Run(request transform.PluginRequest) (trans
 		p.log().Errorf("BuildConfig %s/%s produced unknown conversion outcome %q — passing through unchanged", bc.Namespace, bc.Name, outcome.State)
 		return passThrough, nil
 	}
+}
+
+// passThroughWithDisposition returns the pass-through response with a patch that
+// records why this BuildConfig was not converted, on the BuildConfig itself.
+//
+// A failure to build the patch is not worth failing the migration over: the
+// BuildConfig still passes through unchanged, which is the behaviour BUILD-2318
+// shipped, and the reason is already in the log. Warn and carry on.
+func (p *BuildConfigTransformPlugin) passThroughWithDisposition(u unstructured.Unstructured, outcome Outcome, passThrough transform.PluginResponse) transform.PluginResponse {
+	patch, err := dispositionPatch(u, outcome)
+	if err != nil {
+		p.log().Warnf("BuildConfig %s/%s: could not record the %s disposition on the passed-through BuildConfig: %v", u.GetNamespace(), u.GetName(), outcome.State, err)
+		return passThrough
+	}
+	passThrough.Patches = patch
+	return passThrough
 }
 
 func (p *BuildConfigTransformPlugin) log() logrus.FieldLogger {
@@ -154,15 +172,22 @@ func ParseOptionalFields(extras map[string]string) (PluginOptionalFields, error)
 	if v, ok := extras[DefaultBuildStrategyFlag]; ok && v != "" {
 		opts.StrategyMapping = transform.ParseOptionalFieldMapVal(v)
 	}
-	if v, ok := extras[SearchRegistriesFlag]; ok && v != "" {
-		opts.SearchRegistries = transform.ParseOptionalFieldSliceVal(v)
-	}
-	if v, ok := extras[InsecureRegistriesFlag]; ok && v != "" {
-		opts.InsecureRegistries = transform.ParseOptionalFieldSliceVal(v)
-	}
-	if v, ok := extras[BlockRegistriesFlag]; ok && v != "" {
-		opts.BlockRegistries = transform.ParseOptionalFieldSliceVal(v)
-	}
+	opts.SearchRegistries = parseRegistryList(extras[SearchRegistriesFlag])
+	opts.InsecureRegistries = parseRegistryList(extras[InsecureRegistriesFlag])
+	opts.BlockRegistries = parseRegistryList(extras[BlockRegistriesFlag])
 
 	return opts, nil
+}
+
+// parseRegistryList splits a comma-separated registry list, trims each entry and
+// drops blanks, so a stray comma or padding never reaches registries.conf. A list
+// with nothing left yields nil, and addRegistries then emits no param for it.
+func parseRegistryList(v string) []string {
+	var out []string
+	for _, entry := range strings.Split(v, ",") {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			out = append(out, entry)
+		}
+	}
+	return out
 }

@@ -1,0 +1,37 @@
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: sample-nodejs
+  namespace: my-app
+  labels:
+    application: sample-nodejs
+spec:
+  # ImageStreamTag output target (BC-010) — resolved to the in-cluster registry
+  # via --registry-mapping during transform.
+  output:
+    to:
+      kind: ImageStreamTag
+      name: sample-nodejs:latest
+  source:
+    type: Git
+    git:
+      uri: https://github.com/shipwright-io/sample-nodejs
+      ref: main
+    contextDir: source-build
+  strategy:
+    type: Source
+    sourceStrategy:
+      # ImageStreamTag builder reference (BC-011) — resolved to a concrete
+      # builder image via --imagestream-mapping during transform. Uses a
+      # lightweight, CI-buildable Node.js S2I app.
+      from:
+        kind: ImageStreamTag
+        name: nodejs:18-ubi8
+        namespace: openshift
+      env:
+        - name: NPM_MIRROR
+          value: https://registry.npmjs.org
+  triggers:
+    - type: ConfigChange
+    - type: ImageChange
+      imageChange: {}

@@ -13,8 +13,10 @@ import (
 	shipwrightv1beta1 "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
 	"github.com/sirupsen/logrus"
 	logrustest "github.com/sirupsen/logrus/hooks/test"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/yaml"
 )
 
@@ -131,6 +133,36 @@ func TestParseOptionalFields(t *testing.T) {
 			},
 		},
 		{
+			name: "registry lists are trimmed and blanks dropped",
+			extras: map[string]string{
+				"search-registries":   "docker.io,,quay.io",
+				"insecure-registries": " my-registry.local:5000 , other.local ",
+			},
+			check: func(t *testing.T, opts PluginOptionalFields) {
+				if got := strings.Join(opts.SearchRegistries, ","); got != "docker.io,quay.io" {
+					t.Errorf("SearchRegistries: expected docker.io,quay.io, got %q", got)
+				}
+				if got := strings.Join(opts.InsecureRegistries, ","); got != "my-registry.local:5000,other.local" {
+					t.Errorf("InsecureRegistries: expected my-registry.local:5000,other.local, got %q", got)
+				}
+			},
+		},
+		{
+			name: "registry lists with nothing left are nil",
+			extras: map[string]string{
+				"search-registries": ",",
+				"block-registries":  " , ",
+			},
+			check: func(t *testing.T, opts PluginOptionalFields) {
+				if opts.SearchRegistries != nil {
+					t.Errorf("SearchRegistries should be nil, got %v", opts.SearchRegistries)
+				}
+				if opts.BlockRegistries != nil {
+					t.Errorf("BlockRegistries should be nil, got %v", opts.BlockRegistries)
+				}
+			},
+		},
+		{
 			name: "strategy mapping parsed",
 			extras: map[string]string{
 				"default-build-strategy": "docker=my-buildah,s2i=my-s2i",
@@ -141,6 +173,17 @@ func TestParseOptionalFields(t *testing.T) {
 				}
 				if opts.StrategyMapping["s2i"] != "my-s2i" {
 					t.Errorf("expected s2i=my-s2i, got %s", opts.StrategyMapping["s2i"])
+				}
+			},
+		},
+		{
+			name: "insecure registries parsed",
+			extras: map[string]string{
+				"insecure-registries": "reg.local:80,other.local:5000",
+			},
+			check: func(t *testing.T, opts PluginOptionalFields) {
+				if len(opts.InsecureRegistries) != 2 {
+					t.Fatalf("expected 2 insecure registries, got %d", len(opts.InsecureRegistries))
 				}
 			},
 		},
@@ -159,20 +202,72 @@ func TestParseOptionalFields(t *testing.T) {
 
 func TestResolveImageRef(t *testing.T) {
 	tests := []struct {
-		name        string
-		kind        string
-		refName     string
-		namespace   string
-		opts        PluginOptionalFields
-		wantRef     string
-		wantWarning bool
-		wantErr     bool
+		name                string
+		kind                string
+		refName             string
+		namespace           string
+		opts                PluginOptionalFields
+		wantRef             string
+		wantWarning         bool
+		wantWarningContains string
+		wantErr             bool
 	}{
 		{
-			name:    "DockerImage returns name directly",
+			name:    "qualified DockerImage returns name directly",
 			kind:    "DockerImage",
-			refName: "golang:1.21-alpine",
-			wantRef: "golang:1.21-alpine",
+			refName: "docker.io/library/golang:1.21-alpine",
+			wantRef: "docker.io/library/golang:1.21-alpine",
+		},
+		{
+			name:                "bare DockerImage name warns about lookupPolicy.local",
+			kind:                "DockerImage",
+			refName:             "myapp:latest",
+			namespace:           "ns",
+			wantRef:             "myapp:latest",
+			wantWarning:         true,
+			wantWarningContains: "--imagestream-mapping ns/myapp:latest=",
+		},
+		{
+			name:      "bare DockerImage name resolved via imagestream-mapping",
+			kind:      "DockerImage",
+			refName:   "myapp:latest",
+			namespace: "ns",
+			opts: PluginOptionalFields{
+				ImageStreamMapping: map[string]string{"ns/myapp:latest": "quay.io/o/myapp:1"},
+			},
+			wantRef: "quay.io/o/myapp:1",
+		},
+		{
+			name:      "bare DockerImage name resolved via registry-mapping",
+			kind:      "DockerImage",
+			refName:   "myapp:latest",
+			namespace: "ns",
+			opts: PluginOptionalFields{
+				RegistryMapping: map[string]string{"myapp": "quay.io/o/myapp"},
+			},
+			wantRef: "quay.io/o/myapp:latest",
+		},
+		{
+			name:      "ImageStreamImage resolved via digest mapping key",
+			kind:      "ImageStreamImage",
+			refName:   "s@sha256:abc",
+			namespace: "ns",
+			opts: PluginOptionalFields{
+				ImageStreamMapping: map[string]string{"ns/s@sha256:abc": "quay.io/o/s@sha256:abc"},
+			},
+			wantRef: "quay.io/o/s@sha256:abc",
+		},
+		{
+			name:    "DockerImage with registry and path passes through unchanged",
+			kind:    "DockerImage",
+			refName: "quay.io/o/img:1",
+			wantRef: "quay.io/o/img:1",
+		},
+		{
+			name:    "DockerImage with a path but no registry passes through unchanged",
+			kind:    "DockerImage",
+			refName: "o/img:1",
+			wantRef: "o/img:1",
 		},
 		{
 			name:      "ImageStreamTag resolved via mapping",
@@ -258,7 +353,63 @@ func TestResolveImageRef(t *testing.T) {
 			if !tt.wantWarning && warning != "" {
 				t.Errorf("unexpected warning: %s", warning)
 			}
+			if tt.wantWarningContains != "" && !strings.Contains(warning, tt.wantWarningContains) {
+				t.Errorf("warning = %q, want it to contain %q", warning, tt.wantWarningContains)
+			}
 		})
+	}
+}
+
+// TestConvertBareDockerImageWarnsEndToEnd proves the bare-name warning is not only returned
+// by resolveImageRef but actually surfaced by the caller (c.warnf) and reflected in the
+// Build's conversion outcome. A caller that swallowed the returned warning would pass the
+// resolveImageRef unit test but fail here.
+func TestConvertBareDockerImageWarnsEndToEnd(t *testing.T) {
+	logger, hook := logrustest.NewNullLogger()
+	plugin := &BuildConfigTransformPlugin{Log: logger}
+	request := transform.PluginRequest{
+		Unstructured: unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "build.openshift.io/v1",
+			"kind":       "BuildConfig",
+			"metadata":   map[string]interface{}{"name": "bare-app", "namespace": "myns"},
+			"spec": map[string]interface{}{
+				"source": map[string]interface{}{
+					"type": "Git",
+					"git":  map[string]interface{}{"uri": "https://github.com/example/myapp.git"},
+				},
+				"strategy": map[string]interface{}{
+					"type": "Docker",
+					"dockerStrategy": map[string]interface{}{
+						"from": map[string]interface{}{"kind": "DockerImage", "name": "myapp:latest"},
+					},
+				},
+				"output": map[string]interface{}{
+					"to": map[string]interface{}{"kind": "DockerImage", "name": "quay.io/example/app:latest"},
+				},
+			},
+		}},
+	}
+
+	resp, err := plugin.Run(request)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.NewResources) < 1 {
+		t.Fatal("expected a converted Build")
+	}
+
+	var found bool
+	for _, entry := range hook.AllEntries() {
+		if strings.Contains(entry.Message, "lookupPolicy.local") && strings.Contains(entry.Message, "--imagestream-mapping myns/myapp:latest=") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("bare DockerImage warning was not surfaced by the caller")
+	}
+
+	if got := resp.NewResources[0].GetAnnotations()[ConversionOutcomeAnnotation]; got != string(OutcomeConvertedWithWarnings) {
+		t.Errorf("%s = %q, want %q", ConversionOutcomeAnnotation, got, OutcomeConvertedWithWarnings)
 	}
 }
 
@@ -618,10 +769,7 @@ func TestConvertRegistryParams(t *testing.T) {
 	jsonBytes, _ := json.Marshal(resp.NewResources[0].Object)
 	json.Unmarshal(jsonBytes, b)
 
-	paramsByName := map[string]shipwrightv1beta1.ParamValue{}
-	for _, pv := range b.Spec.ParamValues {
-		paramsByName[pv.Name] = pv
-	}
+	paramsByName := paramValuesByName(b)
 
 	// Search registries
 	searchParam, ok := paramsByName["registries-search"]
@@ -926,6 +1074,156 @@ func TestConvertImageSource(t *testing.T) {
 	}
 }
 
+// TestConvertImageSourceUnsupportedFields covers the degraded path: an image
+// source that also sets `as` and `paths`. Shipwright's OCIArtifact source has no
+// equivalent for either, so the converter warns for each and still produces the
+// Build with an OCIArtifact source (converted-with-warnings, not failed).
+func TestConvertImageSourceUnsupportedFields(t *testing.T) {
+	logger, hook := logrustest.NewNullLogger()
+	plugin := &BuildConfigTransformPlugin{Log: logger}
+	request := transform.PluginRequest{
+		Unstructured: unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "build.openshift.io/v1",
+			"kind":       "BuildConfig",
+			"metadata": map[string]interface{}{
+				"name":      "image-app",
+				"namespace": "myns",
+			},
+			"spec": map[string]interface{}{
+				"source": map[string]interface{}{
+					"type": "Image",
+					"images": []interface{}{
+						map[string]interface{}{
+							"from": map[string]interface{}{
+								"kind": "DockerImage",
+								"name": "registry.example.com/source:latest",
+							},
+							"as": []interface{}{"stage"},
+							"paths": []interface{}{
+								map[string]interface{}{
+									"sourcePath":     "/src/artifacts",
+									"destinationDir": "artifacts",
+								},
+							},
+						},
+					},
+				},
+				"strategy": map[string]interface{}{
+					"type":           "Docker",
+					"dockerStrategy": map[string]interface{}{},
+				},
+				"output": map[string]interface{}{
+					"to": map[string]interface{}{
+						"kind": "DockerImage",
+						"name": "quay.io/example/myapp:latest",
+					},
+				},
+			},
+		}},
+	}
+
+	resp, err := plugin.Run(request)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var sawAs, sawPaths bool
+	for _, entry := range hook.AllEntries() {
+		if entry.Level != logrus.WarnLevel {
+			continue
+		}
+		if strings.Contains(entry.Message, "Image source 'As' field is not supported") {
+			sawAs = true
+		}
+		if strings.Contains(entry.Message, "Image source 'Paths' field is not supported") {
+			sawPaths = true
+		}
+	}
+	if !sawAs {
+		t.Error("expected a warning for the unsupported image source 'As' field")
+	}
+	if !sawPaths {
+		t.Error("expected a warning for the unsupported image source 'Paths' field")
+	}
+
+	// The unsupported sub-fields are dropped, not fatal: the BuildConfig is
+	// still whited out and the Build produced with the image mapped to an
+	// OCIArtifact source.
+	if !resp.IsWhiteOut {
+		t.Error("expected IsWhiteOut to be true for a converted BuildConfig")
+	}
+	if len(resp.NewResources) != 1 {
+		t.Fatalf("expected 1 converted resource, got %d", len(resp.NewResources))
+	}
+	b := &shipwrightv1beta1.Build{}
+	jsonBytes, _ := json.Marshal(resp.NewResources[0].Object)
+	json.Unmarshal(jsonBytes, b)
+	if b.Spec.Source == nil || b.Spec.Source.Type != shipwrightv1beta1.OCIArtifactType {
+		t.Fatalf("expected OCIArtifact source type, got %+v", b.Spec.Source)
+	}
+	if b.Spec.Source.OCIArtifact == nil || b.Spec.Source.OCIArtifact.Image != "registry.example.com/source:latest" {
+		t.Errorf("unexpected OCIArtifact image: %+v", b.Spec.Source.OCIArtifact)
+	}
+}
+
+// TestConvertMultipleImageSources covers the fatal path: Shipwright allows a
+// single source, so a BuildConfig with more than one image source cannot be
+// represented. The conversion fails and the BuildConfig is passed through
+// unchanged — no whiteout, no generated Build.
+func TestConvertMultipleImageSources(t *testing.T) {
+	plugin := &BuildConfigTransformPlugin{Log: logrus.New()}
+	request := transform.PluginRequest{
+		Unstructured: unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "build.openshift.io/v1",
+			"kind":       "BuildConfig",
+			"metadata": map[string]interface{}{
+				"name":      "multi-image-app",
+				"namespace": "myns",
+			},
+			"spec": map[string]interface{}{
+				"source": map[string]interface{}{
+					"type": "Image",
+					"images": []interface{}{
+						map[string]interface{}{
+							"from": map[string]interface{}{
+								"kind": "DockerImage",
+								"name": "registry.example.com/first:latest",
+							},
+						},
+						map[string]interface{}{
+							"from": map[string]interface{}{
+								"kind": "DockerImage",
+								"name": "registry.example.com/second:latest",
+							},
+						},
+					},
+				},
+				"strategy": map[string]interface{}{
+					"type":           "Docker",
+					"dockerStrategy": map[string]interface{}{},
+				},
+				"output": map[string]interface{}{
+					"to": map[string]interface{}{
+						"kind": "DockerImage",
+						"name": "quay.io/example/myapp:latest",
+					},
+				},
+			},
+		}},
+	}
+
+	resp, err := plugin.Run(request)
+	if err != nil {
+		t.Fatalf("expected no error (failed conversion is passed through), got: %v", err)
+	}
+	if resp.IsWhiteOut {
+		t.Error("expected IsWhiteOut to be false for a failed conversion")
+	}
+	if len(resp.NewResources) > 0 {
+		t.Errorf("expected no new resources for a failed conversion, got %d", len(resp.NewResources))
+	}
+}
+
 func TestConvertOutputImageStreamTag(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1012,6 +1310,143 @@ func TestConvertOutputImageStreamTag(t *testing.T) {
 
 			if b.Spec.Output.Image != tt.wantImage {
 				t.Errorf("output image = %q, want %q", b.Spec.Output.Image, tt.wantImage)
+			}
+		})
+	}
+}
+
+// TestConvertInsecureRegistriesRouting covers how a single --insecure-registries
+// intent reaches the two push models: a strategy-managed push (buildah) gets the
+// registries-insecure param, while a Shipwright-managed push (source-to-image)
+// gets spec.output.insecure when its output image lives on an insecure registry.
+func TestConvertInsecureRegistriesRouting(t *testing.T) {
+	tests := []struct {
+		name          string
+		strategyType  string
+		outputImage   string
+		extras        map[string]string
+		wantInsecure  *bool
+		wantParam     bool
+		wantParamVals []string
+	}{
+		{
+			name:         "docker gets registries-insecure param",
+			strategyType: "Docker",
+			outputImage:  "reg.local:80/org/app:latest",
+			extras:       map[string]string{"insecure-registries": "reg.local:80"},
+			wantInsecure: nil,
+			wantParam:    true,
+			wantParamVals: []string{"reg.local:80"},
+		},
+		{
+			name:         "s2i with output on insecure registry sets output.insecure",
+			strategyType: "Source",
+			outputImage:  "reg.local:80/org/app:latest",
+			extras:       map[string]string{"insecure-registries": "reg.local:80"},
+			wantInsecure: func() *bool { b := true; return &b }(),
+			wantParam:    false,
+		},
+		{
+			name:         "s2i with output on a different registry stays secure",
+			strategyType: "Source",
+			outputImage:  "quay.io/org/app:latest",
+			extras:       map[string]string{"insecure-registries": "reg.local:80"},
+			wantInsecure: nil,
+			wantParam:    false,
+		},
+		{
+			name:         "no flag leaves both unset",
+			strategyType: "Source",
+			outputImage:  "reg.local:80/org/app:latest",
+			extras:       nil,
+			wantInsecure: nil,
+			wantParam:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			strategy := map[string]interface{}{
+				"type":           "Docker",
+				"dockerStrategy": map[string]interface{}{},
+			}
+			if tt.strategyType == "Source" {
+				strategy = map[string]interface{}{
+					"type": "Source",
+					"sourceStrategy": map[string]interface{}{
+						"from": map[string]interface{}{
+							"kind": "DockerImage",
+							"name": "registry.redhat.io/ubi8/python-39:latest",
+						},
+					},
+				}
+			}
+			plugin := &BuildConfigTransformPlugin{Log: logrus.New()}
+			request := transform.PluginRequest{
+				Unstructured: unstructured.Unstructured{Object: map[string]interface{}{
+					"apiVersion": "build.openshift.io/v1",
+					"kind":       "BuildConfig",
+					"metadata": map[string]interface{}{
+						"name":      "myapp",
+						"namespace": "myns",
+					},
+					"spec": map[string]interface{}{
+						"source": map[string]interface{}{
+							"type": "Git",
+							"git":  map[string]interface{}{"uri": "https://example.com/repo.git"},
+						},
+						"strategy": strategy,
+						"output": map[string]interface{}{
+							"to": map[string]interface{}{
+								"kind": "DockerImage",
+								"name": tt.outputImage,
+							},
+						},
+					},
+				}},
+				Extras: tt.extras,
+			}
+
+			resp, err := plugin.Run(request)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			b := &shipwrightv1beta1.Build{}
+			jsonBytes, _ := json.Marshal(resp.NewResources[0].Object)
+			json.Unmarshal(jsonBytes, b)
+
+			got := b.Spec.Output.Insecure
+			switch {
+			case tt.wantInsecure == nil && got != nil:
+				t.Errorf("output.insecure = %v, want nil", *got)
+			case tt.wantInsecure != nil && got == nil:
+				t.Errorf("output.insecure = nil, want %v", *tt.wantInsecure)
+			case tt.wantInsecure != nil && got != nil && *got != *tt.wantInsecure:
+				t.Errorf("output.insecure = %v, want %v", *got, *tt.wantInsecure)
+			}
+
+			var param *shipwrightv1beta1.ParamValue
+			for i := range b.Spec.ParamValues {
+				if b.Spec.ParamValues[i].Name == "registries-insecure" {
+					param = &b.Spec.ParamValues[i]
+				}
+			}
+			if tt.wantParam && param == nil {
+				t.Fatal("expected registries-insecure param, got none")
+			}
+			if !tt.wantParam && param != nil {
+				t.Fatalf("unexpected registries-insecure param: %v", param.Values)
+			}
+			if tt.wantParam {
+				if len(param.Values) != len(tt.wantParamVals) {
+					t.Fatalf("registries-insecure values = %v, want %v", param.Values, tt.wantParamVals)
+				}
+				for i, want := range tt.wantParamVals {
+					if param.Values[i].Value == nil || *param.Values[i].Value != want {
+						t.Errorf("registries-insecure[%d] = %v, want %q", i, param.Values[i].Value, want)
+					}
+				}
 			}
 		})
 	}
@@ -1159,19 +1594,126 @@ func TestConvertGitProxyConfig(t *testing.T) {
 	jsonBytes, _ := json.Marshal(resp.NewResources[0].Object)
 	json.Unmarshal(jsonBytes, b)
 
-	envByName := map[string]string{}
-	for _, env := range b.Spec.Env {
-		envByName[env.Name] = env.Value
+	// OpenShift injects both cases; tools inside RUN steps that read only lowercase
+	// (curl ignores uppercase HTTP_PROXY) would otherwise see no proxy. The order
+	// mirrors the build controller: uppercase then lowercase, per variable.
+	want := []corev1.EnvVar{
+		{Name: "HTTP_PROXY", Value: httpProxy},
+		{Name: "http_proxy", Value: httpProxy},
+		{Name: "HTTPS_PROXY", Value: httpsProxy},
+		{Name: "https_proxy", Value: httpsProxy},
+		{Name: "NO_PROXY", Value: noProxy},
+		{Name: "no_proxy", Value: noProxy},
+	}
+	if !reflect.DeepEqual(b.Spec.Env, want) {
+		t.Errorf("Env = %#v, want %#v", b.Spec.Env, want)
+	}
+}
+
+// TestConvertGitProxyConfigNoProxyOnly proves a BuildConfig that sets only noProxy
+// emits exactly the NO_PROXY / no_proxy pair and nothing for the unset variables.
+func TestConvertGitProxyConfigNoProxyOnly(t *testing.T) {
+	plugin := &BuildConfigTransformPlugin{Log: logrus.New()}
+	noProxy := "localhost,127.0.0.1"
+	request := transform.PluginRequest{
+		Unstructured: unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "build.openshift.io/v1",
+			"kind":       "BuildConfig",
+			"metadata": map[string]interface{}{
+				"name":      "proxy-app",
+				"namespace": "myns",
+			},
+			"spec": map[string]interface{}{
+				"source": map[string]interface{}{
+					"type": "Git",
+					"git": map[string]interface{}{
+						"uri":     "https://github.com/example/myapp.git",
+						"noProxy": noProxy,
+					},
+				},
+				"strategy": map[string]interface{}{
+					"type":           "Docker",
+					"dockerStrategy": map[string]interface{}{},
+				},
+				"output": map[string]interface{}{
+					"to": map[string]interface{}{
+						"kind": "DockerImage",
+						"name": "quay.io/example/myapp:latest",
+					},
+				},
+			},
+		}},
 	}
 
-	if envByName["HTTP_PROXY"] != httpProxy {
-		t.Errorf("HTTP_PROXY = %q, want %q", envByName["HTTP_PROXY"], httpProxy)
+	resp, err := plugin.Run(request)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if envByName["HTTPS_PROXY"] != httpsProxy {
-		t.Errorf("HTTPS_PROXY = %q, want %q", envByName["HTTPS_PROXY"], httpsProxy)
+
+	b := &shipwrightv1beta1.Build{}
+	jsonBytes, _ := json.Marshal(resp.NewResources[0].Object)
+	json.Unmarshal(jsonBytes, b)
+
+	want := []corev1.EnvVar{
+		{Name: "NO_PROXY", Value: noProxy},
+		{Name: "no_proxy", Value: noProxy},
 	}
-	if envByName["NO_PROXY"] != noProxy {
-		t.Errorf("NO_PROXY = %q, want %q", envByName["NO_PROXY"], noProxy)
+	if !reflect.DeepEqual(b.Spec.Env, want) {
+		t.Errorf("Env = %#v, want %#v", b.Spec.Env, want)
+	}
+}
+
+// TestConvertGitProxyConfigAppendsAfterStrategyEnv proves the proxy env pairs are appended
+// after env the strategy already contributed, in order — the isolated DeepEqual cases above
+// pass on a 6-element slice regardless of whether the twins prepend or interleave, so this
+// pins the positional behaviour when other env coexists.
+func TestConvertGitProxyConfigAppendsAfterStrategyEnv(t *testing.T) {
+	plugin := &BuildConfigTransformPlugin{Log: logrus.New()}
+	httpProxy := "http://proxy.example.com:8080"
+	request := transform.PluginRequest{
+		Unstructured: unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "build.openshift.io/v1",
+			"kind":       "BuildConfig",
+			"metadata":   map[string]interface{}{"name": "proxy-app", "namespace": "myns"},
+			"spec": map[string]interface{}{
+				"source": map[string]interface{}{
+					"type": "Git",
+					"git": map[string]interface{}{
+						"uri":       "https://github.com/example/myapp.git",
+						"httpProxy": httpProxy,
+					},
+				},
+				"strategy": map[string]interface{}{
+					"type": "Docker",
+					"dockerStrategy": map[string]interface{}{
+						"env": []interface{}{
+							map[string]interface{}{"name": "FOO", "value": "bar"},
+						},
+					},
+				},
+				"output": map[string]interface{}{
+					"to": map[string]interface{}{"kind": "DockerImage", "name": "quay.io/example/myapp:latest"},
+				},
+			},
+		}},
+	}
+
+	resp, err := plugin.Run(request)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	b := &shipwrightv1beta1.Build{}
+	jsonBytes, _ := json.Marshal(resp.NewResources[0].Object)
+	json.Unmarshal(jsonBytes, b)
+
+	want := []corev1.EnvVar{
+		{Name: "FOO", Value: "bar"},
+		{Name: "HTTP_PROXY", Value: httpProxy},
+		{Name: "http_proxy", Value: httpProxy},
+	}
+	if !reflect.DeepEqual(b.Spec.Env, want) {
+		t.Errorf("Env = %#v, want the strategy env first, then the proxy pair: %#v", b.Spec.Env, want)
 	}
 }
 
@@ -1778,11 +2320,14 @@ func buildConfigRequest(name string, opts ...bcOption) transform.PluginRequest {
 			"type":           "Docker",
 			"dockerStrategy": map[string]interface{}{},
 		},
+		// An explicit pushSecret keeps the skeleton warning-free: BUILD-2316
+		// warns when a DockerImage output names no push credential.
 		"output": map[string]interface{}{
 			"to": map[string]interface{}{
 				"kind": "DockerImage",
 				"name": "quay.io/example/myapp:latest",
 			},
+			"pushSecret": map[string]interface{}{"name": "quay-push-secret"},
 		},
 	}
 	for _, opt := range opts {
@@ -1943,7 +2488,7 @@ func TestConvertMetadataLabelsAbsent(t *testing.T) {
 
 func TestConvertMetadataAnnotationsCopied(t *testing.T) {
 	plugin := &BuildConfigTransformPlugin{Log: logrus.New()}
-	request := buildConfigRequest("annotated-app", withAnnotations(map[string]interface{}{
+	request := buildConfigRequest("annotated-app", withSpecField("runPolicy", "Parallel"), withAnnotations(map[string]interface{}{
 		"team":                        "builds",
 		"contact":                     "builds@example.com",
 		"app.kubernetes.io/component": "backend",
@@ -1980,7 +2525,7 @@ func TestConvertMetadataAnnotationsCopied(t *testing.T) {
 func TestConvertMetadataAnnotationsFiltersInternal(t *testing.T) {
 	logger, hook := logrustest.NewNullLogger()
 	plugin := &BuildConfigTransformPlugin{Log: logger}
-	request := buildConfigRequest("internal-annotations-app", withAnnotations(map[string]interface{}{
+	request := buildConfigRequest("internal-annotations-app", withSpecField("runPolicy", "Parallel"), withAnnotations(map[string]interface{}{
 		"openshift.io/generated-by":                        "OpenShiftNewApp",
 		"openshift.io/build-config.name":                   "internal-annotations-app",
 		"kubectl.kubernetes.io/last-applied-configuration": "{}",
@@ -2017,7 +2562,7 @@ func TestConvertMetadataAnnotationsAbsent(t *testing.T) {
 	plugin := &BuildConfigTransformPlugin{Log: logrus.New()}
 
 	// No annotations at all — converted-from must still be present
-	resp, err := plugin.Run(buildConfigRequest("no-annotations-app"))
+	resp, err := plugin.Run(buildConfigRequest("no-annotations-app", withSpecField("runPolicy", "Parallel")))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2442,72 +2987,171 @@ func TestConvertResourcesCustomStrategyOmitsStepResources(t *testing.T) {
 	}
 }
 
-// TestGenerateServiceAccountWarnsOnSharedServiceAccount covers the CodeRabbit
-// finding on BUILD-2261: crane runs this plugin once per resource in its own
-// process, so a ServiceAccount named by spec.serviceAccount and shared with
-// other BuildConfigs is emitted with only this BuildConfig's pull secret. The
-// conversion cannot merge the others, so it must warn instead of losing them
-// silently.
-func TestGenerateServiceAccountWarnsOnSharedServiceAccount(t *testing.T) {
-	tests := []struct {
-		name           string
-		serviceAccount string
-		wantSAName     string
-		wantWarn       bool
-	}{
-		{
-			name:           "shared serviceAccount warns",
-			serviceAccount: "builder",
-			wantSAName:     "builder",
-			wantWarn:       true,
-		},
-		{
-			name:       "serviceAccount derived from BuildConfig name does not warn",
-			wantSAName: "myapp",
-			wantWarn:   false,
-		},
+// TestNamedServiceAccountWithPullSecretIsNotGenerated covers BUILD-2315 D-1:
+// when a BuildConfig names its own ServiceAccount and also carries a pull secret,
+// the plugin must not emit a same-named ServiceAccount. crane migrates the named
+// account as its own resource and this plugin never sees it, so a same-named
+// object would overwrite it (crane keeps the last duplicate; imagePullSecrets is
+// atomic on apply). Instead the plugin keeps the named account in the BuildRun
+// template and warns with the exact oc secrets link command.
+func TestNamedServiceAccountWithPullSecretIsNotGenerated(t *testing.T) {
+	logger, _ := logrustest.NewNullLogger()
+	converter := &Converter{Log: logger}
+
+	bc := parseBuildConfigJSON(t, `{
+		"apiVersion": "build.openshift.io/v1",
+		"kind": "BuildConfig",
+		"metadata": {"name": "myapp", "namespace": "myns"},
+		"spec": {
+			"serviceAccount": "builder",
+			"source": {"type": "Git", "git": {"uri": "https://github.com/example/myapp.git"}},
+			"strategy": {"type": "Docker", "dockerStrategy": {"pullSecret": {"name": "my-pull-secret"}}},
+			"output": {"to": {"kind": "DockerImage", "name": "quay.io/example/myapp:latest"}},
+			"resources": {"limits": {"memory": "2Gi"}}
+		}
+	}`)
+
+	result, outcome := converter.Convert(bc)
+	if outcome.State == OutcomeFailed {
+		t.Fatalf("unexpected conversion failure: %s", outcome.Reason)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			logger, hook := logrustest.NewNullLogger()
-			converter := &Converter{Log: logger}
+	// AC 1: no ServiceAccount is emitted.
+	for _, r := range result {
+		if r.GetKind() == "ServiceAccount" {
+			t.Fatalf("expected no ServiceAccount in NewResources, got one named %q", r.GetName())
+		}
+	}
 
-			serviceAccount := ""
-			if tt.serviceAccount != "" {
-				serviceAccount = fmt.Sprintf(`"serviceAccount": %q,`, tt.serviceAccount)
-			}
-			bc := parseBuildConfigJSON(t, fmt.Sprintf(`{
-				"apiVersion": "build.openshift.io/v1",
-				"kind": "BuildConfig",
-				"metadata": {"name": "myapp", "namespace": "myns"},
-				"spec": {
-					%s
-					"source": {"type": "Git", "git": {"uri": "https://github.com/example/myapp.git"}},
-					"strategy": {"type": "Docker", "dockerStrategy": {"pullSecret": {"name": "my-pull-secret"}}},
-					"output": {"to": {"kind": "DockerImage", "name": "quay.io/example/myapp:latest"}}
-				}
-			}`, serviceAccount))
+	// AC 2: the BuildRun template keeps the named account.
+	value, ok := result[0].GetAnnotations()[BuildRunTemplateAnnotation]
+	if !ok {
+		t.Fatalf("expected annotation %s on the Build", BuildRunTemplateAnnotation)
+	}
+	tmpl := unmarshalBuildRunTemplate(t, value)
+	if tmpl.Spec.ServiceAccount == nil || *tmpl.Spec.ServiceAccount != "builder" {
+		t.Errorf("expected BuildRun spec.serviceAccount builder, got %v", tmpl.Spec.ServiceAccount)
+	}
 
-			sa := converter.generateServiceAccount(bc, converter.getPullSecret(bc))
-			if sa == nil {
-				t.Fatal("expected a generated ServiceAccount")
-			}
-			if sa.Name != tt.wantSAName {
-				t.Errorf("expected ServiceAccount name %q, got %q", tt.wantSAName, sa.Name)
-			}
+	// AC 3: exactly one warning carries the ready-to-run oc secrets link command,
+	// and the outcome annotation records converted-with-warnings.
+	wantCmd := "oc -n myns secrets link builder my-pull-secret --for=pull,mount"
+	linkWarnings := 0
+	for _, w := range outcome.Warnings {
+		if strings.Contains(w, wantCmd) {
+			linkWarnings++
+		}
+	}
+	if linkWarnings != 1 {
+		t.Errorf("expected exactly one warning containing %q, got %d: %v", wantCmd, linkWarnings, outcome.Warnings)
+	}
+	if got := result[0].GetAnnotations()[ConversionOutcomeAnnotation]; got != string(OutcomeConvertedWithWarnings) {
+		t.Errorf("expected conversion-outcome %q, got %q", OutcomeConvertedWithWarnings, got)
+	}
+}
 
-			gotWarn := false
-			for _, entry := range hook.AllEntries() {
-				if entry.Level == logrus.WarnLevel &&
-					strings.Contains(entry.Message, "it may share with other BuildConfigs") {
-					gotWarn = true
-				}
-			}
-			if gotWarn != tt.wantWarn {
-				t.Errorf("expected shared-ServiceAccount warning %v, got %v", tt.wantWarn, gotWarn)
-			}
-		})
+// TestGeneratedServiceAccountCarriesPullSecret covers BUILD-2315 D-1's other
+// branch: with a pull secret and no named ServiceAccount the plugin still
+// generates a <bc-name> account carrying that secret in both imagePullSecrets and
+// secrets, and prints no oc secrets link warning.
+func TestGeneratedServiceAccountCarriesPullSecret(t *testing.T) {
+	logger, _ := logrustest.NewNullLogger()
+	converter := &Converter{Log: logger}
+
+	bc := parseBuildConfigJSON(t, `{
+		"apiVersion": "build.openshift.io/v1",
+		"kind": "BuildConfig",
+		"metadata": {"name": "myapp", "namespace": "myns"},
+		"spec": {
+			"source": {"type": "Git", "git": {"uri": "https://github.com/example/myapp.git"}},
+			"strategy": {"type": "Docker", "dockerStrategy": {"pullSecret": {"name": "my-pull-secret"}}},
+			"output": {"to": {"kind": "DockerImage", "name": "quay.io/example/myapp:latest"}}
+		}
+	}`)
+
+	result, outcome := converter.Convert(bc)
+	if outcome.State == OutcomeFailed {
+		t.Fatalf("unexpected conversion failure: %s", outcome.Reason)
+	}
+
+	var sa *corev1.ServiceAccount
+	saCount := 0
+	for _, r := range result {
+		if r.GetKind() != "ServiceAccount" {
+			continue
+		}
+		saCount++
+		decoded := &corev1.ServiceAccount{}
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(r.Object, decoded); err != nil {
+			t.Fatalf("failed to decode ServiceAccount: %v", err)
+		}
+		sa = decoded
+	}
+	if saCount != 1 {
+		t.Fatalf("expected exactly one ServiceAccount, got %d", saCount)
+	}
+	if sa.Name != "myapp" || sa.Namespace != "myns" {
+		t.Errorf("expected ServiceAccount myns/myapp, got %s/%s", sa.Namespace, sa.Name)
+	}
+	wantPull := []corev1.LocalObjectReference{{Name: "my-pull-secret"}}
+	if !reflect.DeepEqual(sa.ImagePullSecrets, wantPull) {
+		t.Errorf("expected imagePullSecrets %v, got %v", wantPull, sa.ImagePullSecrets)
+	}
+	wantSecrets := []corev1.ObjectReference{{Name: "my-pull-secret"}}
+	if !reflect.DeepEqual(sa.Secrets, wantSecrets) {
+		t.Errorf("expected secrets %v, got %v", wantSecrets, sa.Secrets)
+	}
+
+	for _, w := range outcome.Warnings {
+		if strings.Contains(w, "secrets link") {
+			t.Errorf("did not expect a secrets link warning, got %q", w)
+		}
+	}
+}
+
+// TestNamedServiceAccountWithSourcePullSecretIsNotGenerated mirrors the named-SA
+// case for a Source (S2I) strategy pull secret. getPullSecret reads the pull
+// secret from either strategy, so the D-1 branch must behave identically: no
+// ServiceAccount emitted and the same oc secrets link warning.
+func TestNamedServiceAccountWithSourcePullSecretIsNotGenerated(t *testing.T) {
+	logger, _ := logrustest.NewNullLogger()
+	converter := &Converter{Log: logger}
+
+	bc := parseBuildConfigJSON(t, `{
+		"apiVersion": "build.openshift.io/v1",
+		"kind": "BuildConfig",
+		"metadata": {"name": "myapp", "namespace": "myns"},
+		"spec": {
+			"serviceAccount": "builder",
+			"source": {"type": "Git", "git": {"uri": "https://github.com/example/myapp.git"}},
+			"strategy": {"type": "Source", "sourceStrategy": {"from": {"kind": "DockerImage", "name": "registry.example.com/builder:latest"}, "pullSecret": {"name": "my-pull-secret"}}},
+			"output": {"to": {"kind": "DockerImage", "name": "quay.io/example/myapp:latest"}}
+		}
+	}`)
+
+	result, outcome := converter.Convert(bc)
+	if outcome.State == OutcomeFailed {
+		t.Fatalf("unexpected conversion failure: %s", outcome.Reason)
+	}
+
+	for _, r := range result {
+		if r.GetKind() == "ServiceAccount" {
+			t.Fatalf("expected no ServiceAccount in NewResources, got one named %q", r.GetName())
+		}
+	}
+
+	wantCmd := "oc -n myns secrets link builder my-pull-secret --for=pull,mount"
+	linkWarnings := 0
+	for _, w := range outcome.Warnings {
+		if strings.Contains(w, wantCmd) {
+			linkWarnings++
+		}
+	}
+	if linkWarnings != 1 {
+		t.Errorf("expected exactly one warning containing %q, got %d: %v", wantCmd, linkWarnings, outcome.Warnings)
+	}
+	if got := result[0].GetAnnotations()[ConversionOutcomeAnnotation]; got != string(OutcomeConvertedWithWarnings) {
+		t.Errorf("expected conversion-outcome %q, got %q", OutcomeConvertedWithWarnings, got)
 	}
 }
 
@@ -2732,7 +3376,7 @@ func TestConvertBuildArgsValueFrom(t *testing.T) {
 			logger, hook := logrustest.NewNullLogger()
 			plugin := &BuildConfigTransformPlugin{Log: logger}
 
-			resp, err := plugin.Run(buildConfigRequest("buildargs-test", withBuildArgs(tt.buildArgs)))
+			resp, err := plugin.Run(buildConfigRequest("buildargs-test", withSpecField("runPolicy", "Parallel"), withBuildArgs(tt.buildArgs)))
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -2856,7 +3500,7 @@ func TestConvertBuildArgsWarningsAnnotationBounded(t *testing.T) {
 			logger, hook := logrustest.NewNullLogger()
 			plugin := &BuildConfigTransformPlugin{Log: logger}
 
-			resp, err := plugin.Run(buildConfigRequest("buildargs-test", withBuildArgs(tt.buildArgs)))
+			resp, err := plugin.Run(buildConfigRequest("buildargs-test", withSpecField("runPolicy", "Parallel"), withBuildArgs(tt.buildArgs)))
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -3046,213 +3690,6 @@ func TestConvertRunPolicyWiring(t *testing.T) {
 	}
 }
 
-// TestProcessSourceInlineDockerfile covers BUILD-2275. spec.source.dockerfile holds raw
-// Dockerfile contents, which Shipwright has no field for, so the content cannot be migrated
-// under either strategy: Docker errors, and Source — where the field was previously dropped
-// with no message at all — warns.
-func TestProcessSourceInlineDockerfile(t *testing.T) {
-	inline := "FROM scratch\nCOPY . /app"
-	empty := ""
-
-	tests := []struct {
-		name            string
-		strategyType    buildv1.BuildStrategyType
-		dockerfile      *string
-		wantSourceWarn  bool
-		wantDockerError bool
-	}{
-		{
-			name:           "Source strategy with an inline Dockerfile warns it was not migrated",
-			strategyType:   buildv1.SourceBuildStrategyType,
-			dockerfile:     &inline,
-			wantSourceWarn: true,
-		},
-		{
-			name:         "Source strategy without an inline Dockerfile stays silent",
-			strategyType: buildv1.SourceBuildStrategyType,
-		},
-		{
-			// omitempty on a *string suppresses only a nil pointer, so `dockerfile: ""`
-			// arrives as a non-nil pointer to "". There is no content to lose, and
-			// warning would tell the user to reconfigure a strategy over nothing.
-			name:         "Source strategy with an explicitly empty Dockerfile stays silent",
-			strategyType: buildv1.SourceBuildStrategyType,
-			dockerfile:   &empty,
-		},
-		{
-			name:            "Docker strategy with an inline Dockerfile still errors",
-			strategyType:    buildv1.DockerBuildStrategyType,
-			dockerfile:      &inline,
-			wantDockerError: true,
-		},
-		{
-			name:         "Docker strategy without an inline Dockerfile stays silent",
-			strategyType: buildv1.DockerBuildStrategyType,
-		},
-		{
-			name:         "Docker strategy with an explicitly empty Dockerfile stays silent",
-			strategyType: buildv1.DockerBuildStrategyType,
-			dockerfile:   &empty,
-		},
-		{
-			// Convert() returns before processSource for Custom and JenkinsPipeline, so
-			// those BuildConfigs pass through unchanged and nothing is dropped. Locking
-			// the switch's silence in here means relaxing that early return cannot
-			// quietly reintroduce a silent drop.
-			name:         "Custom strategy falls through the switch without a diagnostic",
-			strategyType: buildv1.CustomBuildStrategyType,
-			dockerfile:   &inline,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			logger, hook := logrustest.NewNullLogger()
-			c := &Converter{Log: logger}
-			bc := &buildv1.BuildConfig{
-				ObjectMeta: metav1.ObjectMeta{Name: "dockerfile-app", Namespace: "myns"},
-				Spec: buildv1.BuildConfigSpec{
-					CommonSpec: buildv1.CommonSpec{
-						Source: buildv1.BuildSource{
-							Dockerfile: tt.dockerfile,
-							Git:        &buildv1.GitBuildSource{URI: "https://example.com/repo.git"},
-						},
-						Strategy: buildv1.BuildStrategy{Type: tt.strategyType},
-					},
-				},
-			}
-
-			c.processSource(bc, &shipwrightv1beta1.Build{})
-
-			var sourceWarn, dockerErr *logrus.Entry
-			var messages []string
-			for _, entry := range hook.AllEntries() {
-				messages = append(messages, entry.Message)
-				if !strings.Contains(entry.Message, "nline Dockerfile") {
-					continue
-				}
-				switch entry.Level {
-				case logrus.WarnLevel:
-					sourceWarn = entry
-				case logrus.ErrorLevel:
-					dockerErr = entry
-				}
-			}
-
-			if (dockerErr != nil) != tt.wantDockerError {
-				t.Errorf("Docker-strategy error emitted = %v, want %v (logged: %q)", dockerErr != nil, tt.wantDockerError, messages)
-			}
-			// Fatal, not Error: the assertions below dereference these entries, so
-			// continuing past a missing log would panic and abort the whole binary.
-			if (sourceWarn != nil) != tt.wantSourceWarn {
-				t.Fatalf("Source-strategy warning emitted = %v, want %v (logged: %q)", sourceWarn != nil, tt.wantSourceWarn, messages)
-			}
-
-			// Both diagnostics must identify the BuildConfig by namespace and name.
-			// Names are unique only within a namespace, so without it a bulk
-			// multi-namespace migration produces unattributable log lines.
-			if tt.wantDockerError && !strings.Contains(dockerErr.Message, "myns/dockerfile-app") {
-				t.Errorf("Docker error = %q, want it to name the BuildConfig as myns/dockerfile-app", dockerErr.Message)
-			}
-			if !tt.wantSourceWarn {
-				return
-			}
-			if !strings.Contains(sourceWarn.Message, "myns/dockerfile-app") {
-				t.Errorf("message = %q, want it to name the BuildConfig as myns/dockerfile-app", sourceWarn.Message)
-			}
-			if !strings.Contains(sourceWarn.Message, "Source-to-Image") {
-				t.Errorf("message = %q, want it to name the strategy that ignores the Dockerfile", sourceWarn.Message)
-			}
-			if !strings.Contains(sourceWarn.Message, "reconfigure the BuildConfig strategy type") {
-				t.Errorf("message = %q, want it to tell the user how to fix the likely misconfiguration", sourceWarn.Message)
-			}
-		})
-	}
-}
-
-// TestConvertInlineDockerfileWiring proves both inline-Dockerfile diagnostics fire during a
-// real conversion, not only when processSource is called directly. Asserting the Docker
-// error here too means a regression that dropped it while still correctly suppressing the
-// Source warning cannot pass unnoticed.
-func TestConvertInlineDockerfileWiring(t *testing.T) {
-	tests := []struct {
-		name      string
-		strategy  map[string]interface{}
-		wantWarn  bool
-		wantError bool
-	}{
-		{
-			name: "Source strategy conversion reports the dropped inline Dockerfile",
-			strategy: map[string]interface{}{
-				"type": "Source",
-				"sourceStrategy": map[string]interface{}{
-					"from": map[string]interface{}{"kind": "DockerImage", "name": "quay.io/example/builder:latest"},
-				},
-			},
-			wantWarn: true,
-		},
-		{
-			name: "Docker strategy conversion errors instead of emitting the Source warning",
-			strategy: map[string]interface{}{
-				"type":           "Docker",
-				"dockerStrategy": map[string]interface{}{},
-			},
-			wantError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			logger, hook := logrustest.NewNullLogger()
-			plugin := &BuildConfigTransformPlugin{Log: logger}
-			request := transform.PluginRequest{
-				Unstructured: unstructured.Unstructured{Object: map[string]interface{}{
-					"apiVersion": "build.openshift.io/v1",
-					"kind":       "BuildConfig",
-					"metadata": map[string]interface{}{
-						"name":      "dockerfile-app",
-						"namespace": "myns",
-					},
-					"spec": map[string]interface{}{
-						"source": map[string]interface{}{
-							"type":       "Git",
-							"git":        map[string]interface{}{"uri": "https://example.com/repo.git"},
-							"dockerfile": "FROM scratch\nCOPY . /app",
-						},
-						"strategy": tt.strategy,
-						"output": map[string]interface{}{
-							"to": map[string]interface{}{"kind": "DockerImage", "name": "quay.io/example/app:latest"},
-						},
-					},
-				}},
-			}
-
-			if _, err := plugin.Run(request); err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			gotWarn, gotError := false, false
-			for _, entry := range hook.AllEntries() {
-				if !strings.Contains(entry.Message, "nline Dockerfile") {
-					continue
-				}
-				switch entry.Level {
-				case logrus.WarnLevel:
-					gotWarn = true
-				case logrus.ErrorLevel:
-					gotError = true
-				}
-			}
-			if gotWarn != tt.wantWarn {
-				t.Errorf("Source-strategy warning emitted = %v, want %v", gotWarn, tt.wantWarn)
-			}
-			if gotError != tt.wantError {
-				t.Errorf("Docker-strategy error emitted = %v, want %v", gotError, tt.wantError)
-			}
-		})
-	}
-}
-
 // --- BUILD-2269: ServiceAccount association warning -------------------------
 //
 // A ServiceAccount named by the BuildConfig lives on the source cluster and
@@ -3407,5 +3844,139 @@ func TestServiceAccountMappedNotLoggedWithoutTemplate(t *testing.T) {
 
 	if infos := logMessages(hook, logrus.InfoLevel, "Mapped serviceAccount"); len(infos) != 0 {
 		t.Errorf("expected no mapped-serviceAccount info when no template is written, got: %v", infos)
+	}
+}
+
+// registriesBuildConfigRequest builds a minimal Docker-strategy BuildConfig request with
+// the given registry extras, for exercising addRegistries edge cases.
+func registriesBuildConfigRequest(extras map[string]string) transform.PluginRequest {
+	req := buildConfigRequest("registries-app")
+	req.Extras = extras
+	return req
+}
+
+// paramValuesByName indexes a Build's paramValues for assertion.
+func paramValuesByName(b *shipwrightv1beta1.Build) map[string]shipwrightv1beta1.ParamValue {
+	byName := map[string]shipwrightv1beta1.ParamValue{}
+	for _, pv := range b.Spec.ParamValues {
+		byName[pv.Name] = pv
+	}
+	return byName
+}
+
+// TestConvertRegistryParamsEdgeCases covers what addRegistries emits for malformed
+// registry lists. ParseOptionalFields trims each entry and drops blanks, so a stray
+// comma or padding never reaches the strategy's registries.conf, and a list with
+// nothing left emits no param at all.
+func TestConvertRegistryParamsEdgeCases(t *testing.T) {
+	tests := []struct {
+		name       string
+		extras     map[string]string
+		wantParams map[string][]string // param name -> expected values; absent key = param must not be emitted
+	}{
+		{
+			name:       "no registry extras emits no registry params",
+			extras:     map[string]string{},
+			wantParams: map[string][]string{},
+		},
+		{
+			name: "empty strings are ignored entirely",
+			extras: map[string]string{
+				SearchRegistriesFlag:   "",
+				InsecureRegistriesFlag: "",
+				BlockRegistriesFlag:    "",
+			},
+			wantParams: map[string][]string{},
+		},
+		{
+			name:   "single value per list",
+			extras: map[string]string{SearchRegistriesFlag: "docker.io"},
+			wantParams: map[string][]string{
+				"registries-search": {"docker.io"},
+			},
+		},
+		{
+			name:   "blank entry between commas is dropped",
+			extras: map[string]string{SearchRegistriesFlag: "docker.io,,quay.io"},
+			wantParams: map[string][]string{
+				"registries-search": {"docker.io", "quay.io"},
+			},
+		},
+		{
+			name:   "surrounding whitespace is trimmed",
+			extras: map[string]string{InsecureRegistriesFlag: " my-registry.local:5000 , other.local "},
+			wantParams: map[string][]string{
+				"registries-insecure": {"my-registry.local:5000", "other.local"},
+			},
+		},
+		{
+			name:       "lone comma emits no param",
+			extras:     map[string]string{BlockRegistriesFlag: ","},
+			wantParams: map[string][]string{},
+		},
+		{
+			name:       "whitespace-only entries emit no param",
+			extras:     map[string]string{BlockRegistriesFlag: " , "},
+			wantParams: map[string][]string{},
+		},
+		{
+			name: "all three lists are emitted independently",
+			extras: map[string]string{
+				SearchRegistriesFlag:   "docker.io,quay.io",
+				InsecureRegistriesFlag: "my-registry.local:5000",
+				BlockRegistriesFlag:    "blocked.io",
+			},
+			wantParams: map[string][]string{
+				"registries-search":   {"docker.io", "quay.io"},
+				"registries-insecure": {"my-registry.local:5000"},
+				"registries-block":    {"blocked.io"},
+			},
+		},
+	}
+
+	registryParams := []string{"registries-search", "registries-insecure", "registries-block"}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plugin := &BuildConfigTransformPlugin{Log: logrus.New()}
+
+			resp, err := plugin.Run(registriesBuildConfigRequest(tt.extras))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			b := decodeBuild(t, resp)
+			byName := paramValuesByName(b)
+
+			for _, name := range registryParams {
+				param, present := byName[name]
+				want, wanted := tt.wantParams[name]
+
+				if !wanted {
+					if present {
+						t.Errorf("param %q should not be emitted, got %+v", name, param.Values)
+					}
+					continue
+				}
+
+				if !present {
+					t.Fatalf("missing param %q", name)
+				}
+				if len(param.Values) != len(want) {
+					t.Fatalf("param %q: expected %d values %q, got %d: %+v",
+						name, len(want), want, len(param.Values), param.Values)
+				}
+				for i, wantVal := range want {
+					got := param.Values[i]
+					if got.Value == nil {
+						t.Errorf("param %q value %d: expected %q, got nil", name, i, wantVal)
+						continue
+					}
+					if *got.Value != wantVal {
+						t.Errorf("param %q value %d: expected %q, got %q", name, i, wantVal, *got.Value)
+					}
+				}
+			}
+		})
 	}
 }

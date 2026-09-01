@@ -35,10 +35,40 @@ check() {
     fi
 }
 
+# Print the spec.volumes block of a converted Build, so volume assertions cannot
+# accidentally match an identically-named field elsewhere in the document.
+vol_block() {
+    awk '/^  volumes:/{f=1;next} f&&/^  [a-zA-Z]/{f=0} f' "$1"
+}
+
+# Count the volume entries in that block.
+vol_count() {
+    vol_block "$1" | grep -c '^    - '
+}
+
+# --- Preflight: crane must be new enough to write plugin-generated resources ---
+# crane v0.0.5 and earlier have no --overwrite on apply and do not write a plugin's
+# NewResources. Against such a build every Shipwright Build assertion below fails, which
+# reads like a plugin bug rather than a stale binary. Fail fast with a real explanation.
+if ! command -v crane >/dev/null 2>&1; then
+    echo "ERROR: no 'crane' on PATH. Build it from migtools/crane main and put it first on PATH."
+    exit 1
+fi
+if ! crane apply --help 2>&1 | grep -q -- '--overwrite'; then
+    echo "ERROR: the 'crane' on PATH is too old — 'crane apply' has no --overwrite flag."
+    echo "       Such a build does not write plugin-generated resources, so no Shipwright"
+    echo "       Build is ever produced and every assertion below fails misleadingly."
+    echo "       Rebuild crane from migtools/crane main and put it first on PATH."
+    exit 1
+fi
+
 # --- Build the plugin ---
 log "Building plugin"
 cd "$PROJECT_DIR"
-GOTOOLCHAIN=auto go build -o "$PLUGIN_DIR/crane-plugin-buildconfig-to-shipwright" .
+# GOWORK=off matches what CI builds, and is required when this checkout is a git
+# worktree nested inside the parent module — the workspace otherwise resolves the
+# worktree path as a subpackage of the parent and the build fails.
+GOWORK=off GOTOOLCHAIN=auto go build -o "$PLUGIN_DIR/crane-plugin-buildconfig-to-shipwright" .
 echo "  Built: $PLUGIN_DIR/crane-plugin-buildconfig-to-shipwright"
 
 # --- Verify plugin metadata ---
@@ -59,7 +89,7 @@ crane transform \
     --export-dir "$EXPORT_DIR" \
     --transform-dir "$TRANSFORM_DIR" \
     --plugin-dir "$PLUGIN_DIR" \
-    --optional-flags '{"imagestream-mapping":"openshift/nodejs:16-ubi8=registry.access.redhat.com/ubi8/nodejs-16:latest","registry-mapping":"image-registry.openshift-image-registry.svc:5000=quay.io/example"}' \
+    --optional-flags '{"imagestream-mapping":"openshift/nodejs:16-ubi8=registry.access.redhat.com/ubi8/nodejs-16:latest","registry-mapping":"image-registry.openshift-image-registry.svc:5000=quay.io/example","search-registries":" docker.io , ,quay.io "}' \
     --skip-plugins KubernetesPlugin \
     2>&1 | sed 's/^/  /'
 
@@ -120,7 +150,9 @@ check 'find "$OUTPUT_DIR" -name "*.yaml" | xargs grep -l "shipwright.io/v1beta1"
     "Shipwright Build resources in final output"
 
 # Verify Docker BuildConfig conversion in detail
-DOCKER_BUILD=$(find "$OUTPUT_DIR" -name "*.yaml" | xargs grep -l "buildah" 2>/dev/null | head -1)
+# Per-resource files only: output.yaml aggregates every resource, and which file
+# find lists first is filesystem-dependent.
+DOCKER_BUILD=$(find "$OUTPUT_DIR/resources" -name 'Build_*.yaml' | xargs grep -l "buildah" 2>/dev/null | head -1)
 if [ -n "$DOCKER_BUILD" ]; then
     pass "Docker → Shipwright Build found: $(basename "$DOCKER_BUILD")"
     check 'grep -q "kind: Build" "$DOCKER_BUILD"' \
@@ -135,12 +167,33 @@ if [ -n "$DOCKER_BUILD" ]; then
         "  git clone secret preserved"
     check 'grep -q "crane.konveyor.io/converted-from" "$DOCKER_BUILD"' \
         "  converted-from annotation present"
+
+    # Strategy volumes → Build spec.volumes. The BuildConfig declares one Secret-backed
+    # volume with a destinationPath; the path is deliberately NOT migrated because
+    # Shipwright defines mount paths in the BuildStrategy, not in the Build.
+    check '[ "$(vol_count "$DOCKER_BUILD")" -eq 1 ]' \
+        "  exactly one volume converted"
+    check 'vol_block "$DOCKER_BUILD" | grep -qE "^(    - |      )name: build-certs$"' \
+        "  volume name preserved"
+    check 'vol_block "$DOCKER_BUILD" | grep -q "secretName: build-certs"' \
+        "  Secret volume source preserved"
+    check '! grep -q "/etc/pki/ca-trust/source/anchors" "$DOCKER_BUILD"' \
+        "  mount destinationPath not migrated (strategy owns mount paths)"
+
+    # Registry lists are trimmed and blank entries dropped before they reach
+    # paramValues; the search-registries flag above is padded on purpose.
+    check 'grep -q "name: registries-search" "$DOCKER_BUILD"' \
+        "  registries-search param emitted"
+    check 'grep -q "value: docker.io$" "$DOCKER_BUILD" && grep -q "value: quay.io$" "$DOCKER_BUILD"' \
+        "  registry entries trimmed"
+    check "! grep -q \"value: ' '\" \"\$DOCKER_BUILD\"" \
+        "  blank registry entry dropped"
 else
     fail "Docker → Shipwright Build not found in output"
 fi
 
 # Verify S2I BuildConfig conversion in detail
-S2I_BUILD=$(find "$OUTPUT_DIR" -name "*.yaml" | xargs grep -l "source-to-image" 2>/dev/null | head -1)
+S2I_BUILD=$(find "$OUTPUT_DIR/resources" -name 'Build_*.yaml' | xargs grep -l "source-to-image" 2>/dev/null | head -1)
 if [ -n "$S2I_BUILD" ]; then
     pass "S2I → Shipwright Build found: $(basename "$S2I_BUILD")"
     check 'grep -q "kind: Build" "$S2I_BUILD"' \
@@ -149,6 +202,16 @@ if [ -n "$S2I_BUILD" ]; then
         "  builder image resolved via imagestream-mapping"
     check 'grep -q "release-2.0" "$S2I_BUILD"' \
         "  git revision preserved"
+
+    # Same contract on the Source strategy, with a ConfigMap-backed volume.
+    check '[ "$(vol_count "$S2I_BUILD")" -eq 1 ]' \
+        "  exactly one volume converted"
+    check 'vol_block "$S2I_BUILD" | grep -qE "^(    - |      )name: app-config$"' \
+        "  volume name preserved"
+    check 'vol_block "$S2I_BUILD" | grep -q "configMap:"' \
+        "  ConfigMap volume source preserved"
+    check '! grep -q "/etc/app-config" "$S2I_BUILD"' \
+        "  mount destinationPath not migrated (strategy owns mount paths)"
 else
     fail "S2I → Shipwright Build not found in output"
 fi

@@ -49,6 +49,11 @@ const (
 	// generated Build so the outcome is observable in the output, not only in
 	// the logs (BUILD-2318). Set to OutcomeConverted or OutcomeConvertedWithWarnings.
 	ConversionOutcomeAnnotation = "buildconfig-to-shipwright/conversion-outcome"
+	// ConversionReasonAnnotation records why a BuildConfig was skipped or failed,
+	// on the passed-through BuildConfig itself. Without it a BuildConfig the
+	// plugin declined is indistinguishable in the output from one it never saw
+	// (BUILD-2319).
+	ConversionReasonAnnotation = "buildconfig-to-shipwright/conversion-reason"
 
 	ConfigMapsRFE = "https://issues.redhat.com/browse/BUILD-1745"
 	SecretsRFE    = "https://issues.redhat.com/browse/BUILD-1744"
@@ -67,6 +72,11 @@ type Converter struct {
 	Log  logrus.FieldLogger
 	Opts PluginOptionalFields
 
+	// curNS and curName name the BuildConfig currently being converted. warnf
+	// reads them to attribute every warning, so a run covering hundreds of
+	// BuildConfigs produces a log an operator can actually trace (BUILD-2319).
+	curNS, curName string
+
 	// warnings collects every conversion warning recorded via warnf so a
 	// conversion can be classified as converted-with-warnings and the messages
 	// surfaced on the Outcome. It accumulates across the Converter's lifetime;
@@ -77,13 +87,6 @@ type Converter struct {
 	// that distinct originals resolving to the same sanitized name within a
 	// single converter lifetime are detected and disambiguated.
 	assignedNames map[string]string
-	// serviceAccounts caches generated ServiceAccounts by namespace/name so
-	// that BuildConfigs sharing a builder ServiceAccount merge their
-	// imagePullSecrets instead of overwriting each other. This only spans one
-	// Converter: crane invokes the plugin once per resource in a separate
-	// process, so BuildConfigs converted by different invocations cannot be
-	// merged here — generateServiceAccount warns when that case is possible.
-	serviceAccounts map[string]*corev1.ServiceAccount
 }
 
 // uniqueName sanitizes a generated resource name into a valid DNS-1123 label
@@ -108,8 +111,7 @@ func (c *Converter) uniqueName(kind, namespace, original string) string {
 			// loudly — but still record it as a conversion warning so the
 			// outcome reflects it.
 			msg := fmt.Sprintf("Hash-suffixed %s name %q for %q still collides with the name already generated for %q — resources may overwrite each other", kind, name, original, owner)
-			c.Log.Error(msg)
-			c.warnings = append(c.warnings, msg)
+			c.Log.Error(c.recordWarning(msg))
 		}
 	}
 	c.assignedNames[key] = original
@@ -117,6 +119,10 @@ func (c *Converter) uniqueName(kind, namespace, original string) string {
 }
 
 func (c *Converter) Convert(bc *buildv1.BuildConfig) ([]unstructured.Unstructured, Outcome) {
+	c.curNS, c.curName = bc.Namespace, bc.Name
+	// Clear the attribution once this conversion is done so a warning raised
+	// later on a reused Converter is not misattributed to this BuildConfig.
+	defer func() { c.curNS, c.curName = "", "" }()
 	startWarnings := len(c.warnings)
 	b := &shipwrightv1beta1.Build{}
 	b.Name = c.uniqueName("Build", bc.Namespace, bc.Name)
@@ -165,13 +171,24 @@ func (c *Converter) Convert(bc *buildv1.BuildConfig) ([]unstructured.Unstructure
 	generatedSA := ""
 	pullSecret := c.getPullSecret(bc)
 	if pullSecret != nil {
-		sa := c.generateServiceAccount(bc, pullSecret)
-		generatedSA = sa.Name
-		saUnstructured, err := toUnstructured(sa)
-		if err != nil {
-			return nil, outcomeFailed(fmt.Sprintf("error converting ServiceAccount to unstructured: %v", err))
+		if bc.Spec.ServiceAccount != "" {
+			// crane migrates the named ServiceAccount as its own resource and
+			// this plugin never sees it, so emitting a same-named account would
+			// overwrite it (crane keeps the last duplicate; imagePullSecrets is
+			// an atomic list on apply). Leave the account alone and tell the
+			// operator how to attach the pull secret on the target.
+			ns, sa, secret := bc.Namespace, bc.Spec.ServiceAccount, pullSecret.Name
+			c.warnf("BuildConfig %s/%s names ServiceAccount %q and pull secret %q. crane migrates that ServiceAccount as-is and this conversion does not modify it, so attach the pull secret on the target cluster before running the BuildRun: oc -n %s secrets link %s %s --for=pull,mount",
+				ns, bc.Name, sa, secret, ns, sa, secret)
+		} else {
+			sa := c.generateServiceAccount(bc, pullSecret)
+			generatedSA = sa.Name
+			saUnstructured, err := toUnstructured(sa)
+			if err != nil {
+				return nil, outcomeFailed(fmt.Sprintf("error converting ServiceAccount to unstructured: %v", err))
+			}
+			newResources = append(newResources, saUnstructured)
 		}
-		newResources = append(newResources, saUnstructured)
 	}
 
 	// A ServiceAccount named by the BuildConfig exists on the source cluster and
@@ -184,6 +201,16 @@ func (c *Converter) Convert(bc *buildv1.BuildConfig) ([]unstructured.Unstructure
 	if bc.Spec.ServiceAccount != "" {
 		c.warnf("The original ServiceAccount %q on BuildConfig %s/%s may carry additional secrets, imagePullSecrets, and RBAC bindings. Verify these associations are available in the target cluster for the Shipwright BuildRun.",
 			bc.Spec.ServiceAccount, bc.Namespace, bc.Name)
+	}
+
+	// Inline Dockerfile → ConfigMap, before processSource so a BuildConfig skipped
+	// above never emits an orphan ConfigMap. Appended after the ServiceAccount.
+	if cm := c.processInlineDockerfile(bc, b); cm != nil {
+		cmUnstructured, err := toUnstructured(cm)
+		if err != nil {
+			return nil, outcomeFailed(fmt.Sprintf("error converting inline-Dockerfile ConfigMap to unstructured: %v", err))
+		}
+		newResources = append(newResources, cmUnstructured)
 	}
 
 	if err := c.processSource(bc, b); err != nil {
@@ -205,10 +232,14 @@ func (c *Converter) Convert(bc *buildv1.BuildConfig) ([]unstructured.Unstructure
 	// Classify the outcome now that every field has been processed, and record
 	// it on the Build so the disposition is observable in the output (BUILD-2318).
 	outcome := outcomeConverted()
-	if newWarnings := c.warnings[startWarnings:]; len(newWarnings) > 0 {
+	if len(c.warnings) > startWarnings {
 		outcome.State = OutcomeConvertedWithWarnings
+		// Build the annotation before snapshotting: boundedWarnings records a
+		// warning of its own when it truncates, and snapshotting first would
+		// leave that notice out of the Outcome the caller sees.
+		b.Annotations[ConversionWarningsAnnotation] = c.boundedWarnings(c.warnings[startWarnings:])
 		// Copy so the Outcome does not alias the Converter's growing slice.
-		outcome.Warnings = append([]string(nil), newWarnings...)
+		outcome.Warnings = append([]string(nil), c.warnings[startWarnings:]...)
 	}
 	b.Annotations[ConversionOutcomeAnnotation] = string(outcome.State)
 
@@ -425,11 +456,6 @@ func (c *Converter) processDockerStrategy(bc *buildv1.BuildConfig, b *shipwright
 	if len(ds.BuildArgs) > 0 {
 		values := []shipwrightv1beta1.SingleValue{}
 		literal, mapped, skipped := 0, 0, 0
-		// Build-arg warnings go through the shared recorder like every other
-		// warning; baStart lets us slice out just this block's warnings for the
-		// (deliberately buildArgs-scoped) ConversionWarningsAnnotation, while
-		// Outcome.Warnings still carries the full set.
-		baStart := len(c.warnings)
 		for _, arg := range ds.BuildArgs {
 			if !validBuildArgName(arg.Name) {
 				c.warnf("Build arg with invalid name %q was skipped — names must be non-empty and must not contain '=', '$', '{', '}', whitespace, or control characters (BuildConfig %s).", arg.Name, bc.Name)
@@ -487,12 +513,6 @@ func (c *Converter) processDockerStrategy(bc *buildv1.BuildConfig, b *shipwright
 				Name:   BuildArgsParamName,
 				Values: values,
 			})
-		}
-		if baWarnings := c.warnings[baStart:]; len(baWarnings) > 0 {
-			if b.Annotations == nil {
-				b.Annotations = map[string]string{}
-			}
-			b.Annotations[ConversionWarningsAnnotation] = c.boundedWarnings(baWarnings)
 		}
 		c.Log.Infof("Processed %d build args: %d literal, %d mapped to ConfigMap/Secret refs, %d skipped for BuildConfig %s", len(ds.BuildArgs), literal, mapped, skipped, bc.Name)
 	}
@@ -685,35 +705,18 @@ func (c *Converter) getPullSecret(bc *buildv1.BuildConfig) *corev1.LocalObjectRe
 	return nil
 }
 
+// generateServiceAccount builds a ServiceAccount that carries the BuildConfig's
+// pull secret. It is only called when the BuildConfig names no ServiceAccount of
+// its own, so the generated name always derives from the BuildConfig name: a
+// named ServiceAccount is migrated by crane as its own resource and this plugin
+// must not emit a same-named object that would overwrite it.
 func (c *Converter) generateServiceAccount(bc *buildv1.BuildConfig, pullSecret *corev1.LocalObjectReference) *corev1.ServiceAccount {
 	if pullSecret == nil {
 		return nil
 	}
-	saName := bc.Spec.ServiceAccount
-	if saName == "" {
-		saName = bc.Name
-	}
-	saName = c.uniqueName("ServiceAccount", bc.Namespace, saName)
+	saName := c.uniqueName("ServiceAccount", bc.Namespace, bc.Name)
 
-	// A BuildConfig that names an existing ServiceAccount may share it with
-	// sibling BuildConfigs. crane runs this plugin once per resource in its own
-	// process, so ServiceAccounts generated for other BuildConfigs are not
-	// visible here: each conversion emits the ServiceAccount carrying only its
-	// own pull secret, and applying them in sequence keeps only the last one.
-	if bc.Spec.ServiceAccount != "" {
-		c.warnf("BuildConfig %s converts pull secret %q into ServiceAccount %q, which it may share with other BuildConfigs — pull secrets from BuildConfigs sharing this ServiceAccount are not merged, so review the generated imagePullSecrets before applying", bc.Name, pullSecret.Name, saName)
-	}
-
-	if c.serviceAccounts == nil {
-		c.serviceAccounts = map[string]*corev1.ServiceAccount{}
-	}
-	key := bc.Namespace + "/" + saName
-	if existing, ok := c.serviceAccounts[key]; ok {
-		mergePullSecret(existing, pullSecret.Name)
-		return existing
-	}
-
-	sa := &corev1.ServiceAccount{
+	return &corev1.ServiceAccount{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
 			Kind:       "ServiceAccount",
@@ -729,34 +732,6 @@ func (c *Converter) generateServiceAccount(bc *buildv1.BuildConfig, pullSecret *
 			{Name: pullSecret.Name},
 		},
 	}
-	c.serviceAccounts[key] = sa
-	return sa
-}
-
-// mergePullSecret adds secretName to the ServiceAccount's imagePullSecrets and
-// secrets lists if not already present, preserving previously merged entries.
-func mergePullSecret(sa *corev1.ServiceAccount, secretName string) {
-	hasPullSecret := false
-	for _, s := range sa.ImagePullSecrets {
-		if s.Name == secretName {
-			hasPullSecret = true
-			break
-		}
-	}
-	if !hasPullSecret {
-		sa.ImagePullSecrets = append(sa.ImagePullSecrets, corev1.LocalObjectReference{Name: secretName})
-	}
-
-	hasSecret := false
-	for _, s := range sa.Secrets {
-		if s.Name == secretName {
-			hasSecret = true
-			break
-		}
-	}
-	if !hasSecret {
-		sa.Secrets = append(sa.Secrets, corev1.ObjectReference{Name: secretName})
-	}
 }
 
 // processSource maps the BuildConfig source onto the Build. It returns an error
@@ -764,43 +739,20 @@ func mergePullSecret(sa *corev1.ServiceAccount, secretName string) {
 // types, an extracted binary archive, multiple image sources, or an
 // unresolvable image) — those leave the Build with no usable source, so the
 // caller fails the whole conversion rather than shipping an incomplete Build
-// (BUILD-2318). Degradations that still yield a usable source (a dropped inline
-// Dockerfile, ignored image As/Paths, an absent source) are warnings, not errors.
+// (BUILD-2318). Degradations that still yield a usable source (ignored image
+// As/Paths, an absent source, a non-git sourceSecret) are warnings, not errors.
+// The inline Dockerfile is handled earlier by processInlineDockerfile.
 func (c *Converter) processSource(bc *buildv1.BuildConfig, b *shipwrightv1beta1.Build) error {
 	git := bc.Spec.Source.Git
 	binary := bc.Spec.Source.Binary
 	images := bc.Spec.Source.Images
-	dockerfile := bc.Spec.Source.Dockerfile
 
-	// Inline Dockerfiles hold raw file contents, which Shipwright cannot represent:
-	// v1beta1 Source has no dockerfile field, and Source-to-Image builds the Dockerfile
-	// it generates itself. The content is unmigratable under either strategy — Docker
-	// errors because the resulting build would differ silently; Source warns because the
-	// field is inapplicable to S2I and usually signals the wrong strategy type.
-	// The empty check is not redundant: omitempty on a *string suppresses only a nil
-	// pointer, so an explicit `dockerfile: ""` unmarshals to a non-nil pointer to "".
-	// That carries no content to lose, and reporting it would tell the user to
-	// reconfigure a strategy over nothing.
-	//
-	// Custom and JenkinsPipeline strategies are absent by design, not oversight:
-	// Convert() returns before processSource for those, passing the BuildConfig
-	// through unchanged, so nothing is dropped and there is nothing to report.
-	//
-	// Either way the drop is recorded in c.warnings so it classifies the conversion
-	// as converted-with-warnings (BUILD-2318). The Docker case logs at ERROR to be
-	// louder, mirroring the uniqueName exception documented on warnf: it records the
-	// message explicitly rather than going through warnf, which logs at WARN.
-	if dockerfile != nil && *dockerfile != "" {
-		switch bc.Spec.Strategy.Type {
-		case buildv1.DockerBuildStrategyType:
-			msg := fmt.Sprintf("Inline Dockerfile is not supported in buildah strategy for BuildConfig %s/%s. Consider moving it to a separate file.", bc.Namespace, bc.Name)
-			c.warnings = append(c.warnings, msg)
-			c.Log.Errorf("%s", msg)
-		case buildv1.SourceBuildStrategyType:
-			c.warnf("BuildConfig %s/%s has an inline Dockerfile set on a Source strategy. "+
-				"Inline Dockerfiles are not used by Source-to-Image and were not migrated. "+
-				"If this was intended for a Docker strategy build, reconfigure the BuildConfig strategy type.", bc.Namespace, bc.Name)
-		}
+	// sourceSecret only authenticates git clones (ssh-privatekey / basic-auth). On a
+	// binary, image, or source-less BuildConfig it was inert on OpenShift too, so there
+	// is nothing to map — warn once, attributed to the BuildConfig, and drop it. This
+	// fires before the multiple-source error below so the drop is recorded either way.
+	if git == nil && bc.Spec.Source.SourceSecret != nil && bc.Spec.Source.SourceSecret.Name != "" {
+		c.warnf("BuildConfig %s/%s sets sourceSecret %q but has no git source; sourceSecret only authenticates git clones and was not migrated.", bc.Namespace, bc.Name, bc.Spec.Source.SourceSecret.Name)
 	}
 
 	sourceCount := 0
@@ -923,14 +875,24 @@ func (c *Converter) processGitProxyConfig(bc *buildv1.BuildConfig, b *shipwright
 		return
 	}
 	proxyConfig := bc.Spec.Source.Git.ProxyConfig
+	// OpenShift's build controller injects both the uppercase and lowercase forms
+	// (defaults.go@5235418:98-108); tools inside RUN steps that read only lowercase
+	// (curl ignores uppercase HTTP_PROXY by design) would otherwise see no proxy.
+	// Emit the lowercase twin right after each uppercase entry, same value, no dedupe.
 	if proxyConfig.HTTPProxy != nil && *proxyConfig.HTTPProxy != "" {
-		b.Spec.Env = append(b.Spec.Env, corev1.EnvVar{Name: "HTTP_PROXY", Value: *proxyConfig.HTTPProxy})
+		b.Spec.Env = append(b.Spec.Env,
+			corev1.EnvVar{Name: "HTTP_PROXY", Value: *proxyConfig.HTTPProxy},
+			corev1.EnvVar{Name: "http_proxy", Value: *proxyConfig.HTTPProxy})
 	}
 	if proxyConfig.HTTPSProxy != nil && *proxyConfig.HTTPSProxy != "" {
-		b.Spec.Env = append(b.Spec.Env, corev1.EnvVar{Name: "HTTPS_PROXY", Value: *proxyConfig.HTTPSProxy})
+		b.Spec.Env = append(b.Spec.Env,
+			corev1.EnvVar{Name: "HTTPS_PROXY", Value: *proxyConfig.HTTPSProxy},
+			corev1.EnvVar{Name: "https_proxy", Value: *proxyConfig.HTTPSProxy})
 	}
 	if proxyConfig.NoProxy != nil && *proxyConfig.NoProxy != "" {
-		b.Spec.Env = append(b.Spec.Env, corev1.EnvVar{Name: "NO_PROXY", Value: *proxyConfig.NoProxy})
+		b.Spec.Env = append(b.Spec.Env,
+			corev1.EnvVar{Name: "NO_PROXY", Value: *proxyConfig.NoProxy},
+			corev1.EnvVar{Name: "no_proxy", Value: *proxyConfig.NoProxy})
 	}
 }
 
@@ -938,7 +900,8 @@ func (c *Converter) processOutput(bc *buildv1.BuildConfig, b *shipwrightv1beta1.
 	if bc.Spec.Output.To == nil {
 		return
 	}
-	if bc.Spec.Output.To.Kind == "ImageStreamTag" {
+	isImageStreamTag := bc.Spec.Output.To.Kind == "ImageStreamTag"
+	if isImageStreamTag {
 		namespace := bc.Spec.Output.To.Namespace
 		if namespace == "" {
 			namespace = bc.Namespace
@@ -958,15 +921,31 @@ func (c *Converter) processOutput(bc *buildv1.BuildConfig, b *shipwrightv1beta1.
 			)
 			c.warnf("Output ImageStreamTag %q resolved to fallback URL: %s", name, b.Spec.Output.Image)
 		}
-		if bc.Spec.Output.PushSecret == nil || bc.Spec.Output.PushSecret.Name == "" {
-			c.warnf("%s", "No explicit pushSecret found for ImageStreamTag output. Ensure the BuildRun uses a ServiceAccount with internal registry push access.")
+		// A push that no longer lands on the internal registry never updates the
+		// source ImageStream, so any Deployment or DeploymentConfig watching it
+		// to roll out silently stops firing (BUILD-2316, D-4). The check is the
+		// registry prefix, not the exact path: a redirect that keeps the prefix
+		// but changes the imagestream path is an accepted blind spot (D-4), since
+		// the common redirect — to an external registry — always drops the prefix.
+		if !strings.HasPrefix(b.Spec.Output.Image, internalRegistryURL+"/") {
+			c.warnf("Output image for ImageStreamTag %q was redirected off the internal registry to %q; the ImageStream will no longer be updated, so any Deployment or DeploymentConfig watching it to roll out will stop firing.", namespace+"/"+name, b.Spec.Output.Image)
 		}
 	} else {
 		b.Spec.Output.Image = bc.Spec.Output.To.Name
 	}
 
+	// The push credential is carried across only when the BuildConfig names one;
+	// the plugin cannot read the builder ServiceAccount to derive it (BUILD-2316,
+	// D-5). When none is carried, warn on both output kinds rather than only on
+	// ImageStreamTag (D-3), with the remedy that fits each: an internal-registry
+	// push needs a ServiceAccount with registry access, an external-registry push
+	// needs a real registry credential secret.
 	if bc.Spec.Output.PushSecret != nil && bc.Spec.Output.PushSecret.Name != "" {
 		b.Spec.Output.PushSecret = &bc.Spec.Output.PushSecret.Name
+	} else if isImageStreamTag {
+		c.warnf("%s", "No explicit pushSecret found for ImageStreamTag output. Ensure the BuildRun uses a ServiceAccount with internal registry push access.")
+	} else {
+		c.warnf("%s", "No explicit pushSecret found for DockerImage output. Set spec.output.pushSecret to a registry credential secret, or ensure the BuildRun ServiceAccount carries credentials for the target registry; otherwise the push will fail.")
 	}
 
 	c.processOutputImageLabels(bc, b)
@@ -1047,7 +1026,7 @@ func (c *Converter) processNodeSelector(bc *buildv1.BuildConfig, b *shipwrightv1
 	}
 
 	if err := validateNodeSelector(bc.Spec.NodeSelector); err != nil {
-		c.Log.Warnf("nodeSelector on BuildConfig %s/%s is invalid: %v; dropping the whole nodeSelector — migrated builds will not be pinned to any node",
+		c.warnf("nodeSelector on BuildConfig %s/%s is invalid: %v; dropping the whole nodeSelector — migrated builds will not be pinned to any node",
 			bc.Namespace, bc.Name, err)
 		return
 	}
@@ -1167,10 +1146,26 @@ func (c *Converter) addRegistries(b *shipwrightv1beta1.Build) {
 		})
 	}
 	if len(c.Opts.InsecureRegistries) > 0 {
-		b.Spec.ParamValues = append(b.Spec.ParamValues, shipwrightv1beta1.ParamValue{
-			Name:   "registries-insecure",
-			Values: toSingleValues(c.Opts.InsecureRegistries),
-		})
+		// The two strategies push two different ways, so "this registry is
+		// insecure" is expressed two different ways. A strategy-managed push
+		// (buildah) reads the registries-insecure param off the Build. A
+		// Shipwright-managed push (source-to-image) has no such param and would
+		// be rejected with UndefinedParameter; it honors spec.output.insecure
+		// instead. Route the single --insecure-registries intent to whichever
+		// the converted strategy uses, keyed on the default strategy names the
+		// plugin emits. A custom strategy override keeps the buildah-style param,
+		// since we cannot know how it pushes.
+		if b.Spec.Strategy.Name == defaultS2IStrategy {
+			if slices.Contains(c.Opts.InsecureRegistries, imageRegistryHost(b.Spec.Output.Image)) {
+				insecure := true
+				b.Spec.Output.Insecure = &insecure
+			}
+		} else {
+			b.Spec.ParamValues = append(b.Spec.ParamValues, shipwrightv1beta1.ParamValue{
+				Name:   "registries-insecure",
+				Values: toSingleValues(c.Opts.InsecureRegistries),
+			})
+		}
 	}
 	if len(c.Opts.BlockRegistries) > 0 {
 		b.Spec.ParamValues = append(b.Spec.ParamValues, shipwrightv1beta1.ParamValue{

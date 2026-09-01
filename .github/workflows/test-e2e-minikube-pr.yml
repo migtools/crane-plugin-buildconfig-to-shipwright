@@ -32,9 +32,12 @@ jobs:
 
       - name: Install crane CLI
         run: |
-          git clone https://github.com/konveyor/crane.git /tmp/crane
+          git clone https://github.com/migtools/crane.git /tmp/crane
           cd /tmp/crane
-          git checkout 45826fe4367a4522bfb1557e6432eaeaf49b15f3 # v0.10.0
+          # Pin crane so an upstream change to main can't break our CI. Needs
+          # NewResources (PR #766) and positional stage selection; bump for newer
+          # crane versions.
+          git checkout d566a18f6640cd79c8568749d6621b40486d0625
           go build -o crane .
           sudo mv crane /usr/local/bin/
           crane version
@@ -90,15 +93,10 @@ jobs:
           kubectl create namespace my-app
           kubectl get namespace my-app
 
-      # TODO: Add E2E test execution here
-      # - name: Run E2E tests
-      #   run: |
-      #     # Placeholder for E2E test execution
-      #     # Example:
-      #     # ./tests/e2e-minikube.sh
-      #     # or
-      #     # go test -v ./tests/e2e/...
-      #     echo "E2E tests will be implemented here"
+      - name: Run cluster E2E test
+        run: |
+          # BuildConfig → crane transform → Shipwright Build → BuildRun on the cluster
+          ./tests/e2e-cluster.sh
 
       - name: Collect logs on failure
         if: failure()

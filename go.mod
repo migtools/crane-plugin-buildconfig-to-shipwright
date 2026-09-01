@@ -3,6 +3,7 @@ module github.com/migtools/crane-plugin-buildconfig-to-shipwright
 go 1.26.3
 
 require (
+	github.com/evanphx/json-patch v5.9.11+incompatible
 	github.com/konveyor/crane-lib v0.1.6-0.20260807130033-222a325c7cee
 	github.com/openshift/api v0.0.0-20220525145417-ee5b62754c68
 	github.com/shipwright-io/build v0.20.11
@@ -13,7 +14,6 @@ require (
 )
 
 require (
-	github.com/evanphx/json-patch v5.9.11+incompatible // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/zapr v1.3.0 // indirect

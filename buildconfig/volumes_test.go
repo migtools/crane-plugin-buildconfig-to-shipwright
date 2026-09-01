@@ -60,263 +60,213 @@ func decodeBuild(t *testing.T, resp transform.PluginResponse) *shipwrightv1beta1
 	return b
 }
 
-func TestConvertDockerStrategyVolumes(t *testing.T) {
-	logger, hook := logrustest.NewNullLogger()
-	plugin := &BuildConfigTransformPlugin{Log: logger}
-	request := volumesBuildConfigRequest("Docker", "dockerStrategy", []interface{}{
-		map[string]interface{}{
-			"name":   "secret-vol",
-			"source": map[string]interface{}{"type": "Secret", "secret": map[string]interface{}{"secretName": "my-secret"}},
-		},
-		map[string]interface{}{
-			"name":   "config-vol",
-			"source": map[string]interface{}{"type": "ConfigMap", "configMap": map[string]interface{}{"name": "my-config"}},
-		},
-		map[string]interface{}{
-			"name":   "csi-vol",
-			"source": map[string]interface{}{"type": "CSI", "csi": map[string]interface{}{"driver": "inline.storage.kubernetes.io"}},
-		},
-	})
-
-	resp, err := plugin.Run(request)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	b := decodeBuild(t, resp)
-
-	// Supported volumes are converted; unsupported CSI volume is skipped.
-	if len(b.Spec.Volumes) != 2 {
-		t.Fatalf("expected 2 Build spec volumes, got %d: %+v", len(b.Spec.Volumes), b.Spec.Volumes)
-	}
-	if b.Spec.Volumes[0].Name != "secret-vol" || b.Spec.Volumes[0].Secret == nil || b.Spec.Volumes[0].Secret.SecretName != "my-secret" {
-		t.Errorf("unexpected secret volume: %+v", b.Spec.Volumes[0])
-	}
-	if b.Spec.Volumes[1].Name != "config-vol" || b.Spec.Volumes[1].ConfigMap == nil || b.Spec.Volumes[1].ConfigMap.Name != "my-config" {
-		t.Errorf("unexpected configMap volume: %+v", b.Spec.Volumes[1])
-	}
-
-	var sawSkip, sawSummary bool
-	remediation := map[string]bool{}
-	for _, entry := range hook.AllEntries() {
-		if strings.Contains(entry.Message, `Skipping volume "csi-vol"`) && strings.Contains(entry.Message, "unsupported volume source type") {
-			sawSkip = true
-			if entry.Level != logrus.WarnLevel {
-				t.Errorf("skip message should be warn-level, got %s", entry.Level)
-			}
-		}
-		if strings.Contains(entry.Message, "Volumes were converted to Build spec volumes") && strings.Contains(entry.Message, "Buildah") {
-			sawSummary = true
-			if !strings.Contains(entry.Message, "Registered=False") || !strings.Contains(entry.Message, "UndefinedVolume") {
-				t.Errorf("summary warning must state the real failure (Registered=False, UndefinedVolume), got %q", entry.Message)
-			}
-			if !strings.Contains(entry.Message, "docs/volume-migration.md") {
-				t.Errorf("summary warning must reference the runbook, got %q", entry.Message)
-			}
-			if entry.Level != logrus.WarnLevel {
-				t.Errorf("summary message should be warn-level, got %s", entry.Level)
-			}
-		}
-		for _, name := range []string{"secret-vol", "config-vol"} {
-			if strings.Contains(entry.Message, "add an overridable volume named '"+name+"'") {
-				remediation[name] = true
-				if !strings.Contains(entry.Message, "UndefinedVolume") ||
-					!strings.Contains(entry.Message, "(2) add a volumeMount") ||
-					!strings.Contains(entry.Message, "(3) point the Build at the strategy copy") {
-					t.Errorf("per-volume remediation for %s incomplete: %q", name, entry.Message)
-				}
-			}
-		}
-		// Old wording implying volumes are not converted must be gone.
-		if strings.Contains(entry.Message, "Volumes require the Buildah ClusterBuildStrategy") {
-			t.Errorf("old volumes warning still emitted: %q", entry.Message)
-		}
-		// The pre-BUILD-2324 understatement and stale RFE link must be gone.
-		if strings.Contains(entry.Message, "only take effect") || strings.Contains(entry.Message, "BUILD-1747") {
-			t.Errorf("stale volume warning wording still emitted: %q", entry.Message)
-		}
-	}
-	if !sawSkip {
-		t.Error("expected warn-and-skip message for unsupported CSI volume")
-	}
-	if !sawSummary {
-		t.Error("expected UndefinedVolume summary warning for Docker strategy")
-	}
-	if !remediation["secret-vol"] || !remediation["config-vol"] {
-		t.Errorf("expected per-volume remediation warnings for secret-vol and config-vol, got %v", remediation)
-	}
+// wantVolume is one expected entry of a converted Build's spec.volumes.
+type wantVolume struct {
+	name          string
+	secretName    string
+	configMapName string
 }
 
-func TestConvertSourceStrategyVolumes(t *testing.T) {
-	logger, hook := logrustest.NewNullLogger()
-	plugin := &BuildConfigTransformPlugin{Log: logger}
-	request := volumesBuildConfigRequest("Source", "sourceStrategy", []interface{}{
-		map[string]interface{}{
-			"name":   "secret-vol",
-			"source": map[string]interface{}{"type": "Secret", "secret": map[string]interface{}{"secretName": "my-secret"}},
-		},
-	})
-
-	resp, err := plugin.Run(request)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	b := decodeBuild(t, resp)
-	if len(b.Spec.Volumes) != 1 || b.Spec.Volumes[0].Name != "secret-vol" {
-		t.Fatalf("expected 1 Build spec volume named secret-vol, got %+v", b.Spec.Volumes)
-	}
-
-	sawSummary := false
-	sawRemediation := false
+// firstEntry returns the first log entry that satisfies pred, or nil.
+func firstEntry(hook *logrustest.Hook, pred func(*logrus.Entry) bool) *logrus.Entry {
 	for _, entry := range hook.AllEntries() {
-		if strings.Contains(entry.Message, "Volumes were converted to Build spec volumes") && strings.Contains(entry.Message, "Source-to-Image") {
-			sawSummary = true
-			if !strings.Contains(entry.Message, "Registered=False") || !strings.Contains(entry.Message, "UndefinedVolume") {
-				t.Errorf("summary warning must state the real failure (Registered=False, UndefinedVolume), got %q", entry.Message)
-			}
-		}
-		if strings.Contains(entry.Message, "add an overridable volume named 'secret-vol'") {
-			sawRemediation = true
+		if pred(entry) {
+			return entry
 		}
 	}
-	if !sawSummary {
-		t.Error("expected UndefinedVolume summary warning for Source strategy")
-	}
-	if !sawRemediation {
-		t.Error("expected per-volume remediation warning for secret-vol")
-	}
+	return nil
 }
 
-func TestConvertStrategyVolumeMounts(t *testing.T) {
-	logger, hook := logrustest.NewNullLogger()
-	plugin := &BuildConfigTransformPlugin{Log: logger}
-	request := volumesBuildConfigRequest("Docker", "dockerStrategy", []interface{}{
-		map[string]interface{}{
-			"name":   "secret-vol",
-			"source": map[string]interface{}{"type": "Secret", "secret": map[string]interface{}{"secretName": "my-secret"}},
-			"mounts": []interface{}{
-				map[string]interface{}{"destinationPath": "/etc/npm"},
-				map[string]interface{}{"destinationPath": "/etc/pip"},
+// entryContaining returns the first log entry whose message contains every
+// substring, or nil.
+func entryContaining(hook *logrustest.Hook, substrs ...string) *logrus.Entry {
+	return firstEntry(hook, func(entry *logrus.Entry) bool {
+		for _, s := range substrs {
+			if !strings.Contains(entry.Message, s) {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+func TestConvertStrategyVolumes(t *testing.T) {
+	secretVol := map[string]interface{}{
+		"name":   "secret-vol",
+		"source": map[string]interface{}{"type": "Secret", "secret": map[string]interface{}{"secretName": "my-secret"}},
+	}
+	configVol := map[string]interface{}{
+		"name":   "config-vol",
+		"source": map[string]interface{}{"type": "ConfigMap", "configMap": map[string]interface{}{"name": "my-config"}},
+	}
+	csiVol := map[string]interface{}{
+		"name":   "csi-vol",
+		"source": map[string]interface{}{"type": "CSI", "csi": map[string]interface{}{"driver": "inline.storage.kubernetes.io"}},
+	}
+
+	tests := []struct {
+		name         string
+		strategyType string
+		strategyKey  string
+		volumes      []interface{}
+		wantVolumes  []wantVolume
+		// wantWarn lists groups of substrings; each group must co-occur in one
+		// warn-level entry.
+		wantWarn [][]string
+		// wantAbsent lists substrings no entry may contain.
+		wantAbsent   []string
+		wantNoErrors bool
+	}{
+		{
+			name:         "docker: secret, configMap, csi",
+			strategyType: "Docker",
+			strategyKey:  "dockerStrategy",
+			volumes:      []interface{}{secretVol, configVol, csiVol},
+			// Supported volumes are converted; the unsupported CSI volume is skipped.
+			wantVolumes: []wantVolume{
+				{name: "secret-vol", secretName: "my-secret"},
+				{name: "config-vol", configMapName: "my-config"},
+			},
+			wantWarn: [][]string{
+				{`Skipping volume "csi-vol"`, "unsupported volume source type"},
+				{"Volumes were converted to Build spec volumes", "Buildah", "Registered=False", "UndefinedVolume", "docs/volume-migration.md"},
+				{"add an overridable volume named 'secret-vol'", "UndefinedVolume", "(2) add a volumeMount", "(3) point the Build at the strategy copy"},
+				{"add an overridable volume named 'config-vol'", "UndefinedVolume", "(2) add a volumeMount", "(3) point the Build at the strategy copy"},
+			},
+			// The old wording implying volumes are not converted, the pre-BUILD-2324
+			// understatement and the stale RFE link must all be gone.
+			wantAbsent: []string{"Volumes require the Buildah ClusterBuildStrategy", "only take effect", "BUILD-1747"},
+		},
+		{
+			name:         "source: secret",
+			strategyType: "Source",
+			strategyKey:  "sourceStrategy",
+			volumes:      []interface{}{secretVol},
+			wantVolumes:  []wantVolume{{name: "secret-vol", secretName: "my-secret"}},
+			wantWarn: [][]string{
+				{"Volumes were converted to Build spec volumes", "Source-to-Image", "Registered=False", "UndefinedVolume"},
+				{"add an overridable volume named 'secret-vol'"},
 			},
 		},
-	})
-
-	if _, err := plugin.Run(request); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	sawRemediation := false
-	for _, entry := range hook.AllEntries() {
-		if entry.Level == logrus.ErrorLevel {
-			t.Errorf("no error-level logs expected, got %q", entry.Message)
-		}
-		if strings.Contains(entry.Message, `Volume "secret-vol" was converted`) {
-			sawRemediation = true
-			if !strings.Contains(entry.Message, "original BuildConfig destination paths: /etc/npm, /etc/pip") {
-				t.Errorf("remediation warning should echo destination paths, got %q", entry.Message)
-			}
-			if !strings.Contains(entry.Message, "(1) add an overridable volume named 'secret-vol'") ||
-				!strings.Contains(entry.Message, "overridable: true") ||
-				!strings.Contains(entry.Message, "(2) add a volumeMount for 'secret-vol'") ||
-				!strings.Contains(entry.Message, "(3) point the Build at the strategy copy via spec.strategy.name") {
-				t.Errorf("remediation warning missing 3-step guidance: %q", entry.Message)
-			}
-			if entry.Level != logrus.WarnLevel {
-				t.Errorf("remediation message should be warn-level, got %s", entry.Level)
-			}
-		}
-	}
-	if !sawRemediation {
-		t.Error("expected per-volume remediation warning with mount paths")
-	}
-}
-
-func TestConvertStrategyVolumesInvalidNames(t *testing.T) {
-	logger, hook := logrustest.NewNullLogger()
-	plugin := &BuildConfigTransformPlugin{Log: logger}
-	request := volumesBuildConfigRequest("Docker", "dockerStrategy", []interface{}{
-		map[string]interface{}{
-			"name":   "",
-			"source": map[string]interface{}{"type": "Secret", "secret": map[string]interface{}{"secretName": "unnamed-secret"}},
+		{
+			name:         "docker: mount paths echoed in the remediation",
+			strategyType: "Docker",
+			strategyKey:  "dockerStrategy",
+			volumes: []interface{}{
+				map[string]interface{}{
+					"name":   "secret-vol",
+					"source": map[string]interface{}{"type": "Secret", "secret": map[string]interface{}{"secretName": "my-secret"}},
+					"mounts": []interface{}{
+						map[string]interface{}{"destinationPath": "/etc/npm"},
+						map[string]interface{}{"destinationPath": "/etc/pip"},
+					},
+				},
+			},
+			wantVolumes: []wantVolume{{name: "secret-vol", secretName: "my-secret"}},
+			wantWarn: [][]string{
+				{
+					`Volume "secret-vol" was converted`,
+					"original BuildConfig destination paths: /etc/npm, /etc/pip",
+					"(1) add an overridable volume named 'secret-vol'",
+					"overridable: true",
+					"(2) add a volumeMount for 'secret-vol'",
+					"(3) point the Build at the strategy copy via spec.strategy.name",
+				},
+			},
+			wantNoErrors: true,
 		},
-		map[string]interface{}{
-			"name":   "dup-vol",
-			"source": map[string]interface{}{"type": "Secret", "secret": map[string]interface{}{"secretName": "first-secret"}},
+		{
+			name:         "docker: empty and duplicate names",
+			strategyType: "Docker",
+			strategyKey:  "dockerStrategy",
+			volumes: []interface{}{
+				map[string]interface{}{
+					"name":   "",
+					"source": map[string]interface{}{"type": "Secret", "secret": map[string]interface{}{"secretName": "unnamed-secret"}},
+				},
+				map[string]interface{}{
+					"name":   "dup-vol",
+					"source": map[string]interface{}{"type": "Secret", "secret": map[string]interface{}{"secretName": "first-secret"}},
+				},
+				map[string]interface{}{
+					"name":   "dup-vol",
+					"source": map[string]interface{}{"type": "ConfigMap", "configMap": map[string]interface{}{"name": "second-config"}},
+				},
+			},
+			// The empty-name volume and the duplicate are skipped; the first dup-vol wins.
+			wantVolumes: []wantVolume{{name: "dup-vol", secretName: "first-secret"}},
+			wantWarn: [][]string{
+				{"Skipping volume with empty name"},
+				{`Skipping duplicate volume "dup-vol"`},
+			},
 		},
-		map[string]interface{}{
-			"name":   "dup-vol",
-			"source": map[string]interface{}{"type": "ConfigMap", "configMap": map[string]interface{}{"name": "second-config"}},
+		{
+			name:         "docker: every volume skipped",
+			strategyType: "Docker",
+			strategyKey:  "dockerStrategy",
+			volumes:      []interface{}{csiVol},
+			// When nothing was converted, neither the summary warning nor a per-volume
+			// remediation may be emitted; both would falsely claim success.
+			wantAbsent: []string{"Volumes were converted to Build spec volumes", "add an overridable volume named"},
 		},
-	})
-
-	resp, err := plugin.Run(request)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
 	}
 
-	b := decodeBuild(t, resp)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, hook := logrustest.NewNullLogger()
+			plugin := &BuildConfigTransformPlugin{Log: logger}
 
-	// Empty-name volume and the duplicate are skipped; first dup-vol wins.
-	if len(b.Spec.Volumes) != 1 {
-		t.Fatalf("expected 1 Build spec volume, got %d: %+v", len(b.Spec.Volumes), b.Spec.Volumes)
-	}
-	if b.Spec.Volumes[0].Name != "dup-vol" || b.Spec.Volumes[0].Secret == nil || b.Spec.Volumes[0].Secret.SecretName != "first-secret" {
-		t.Errorf("expected first dup-vol (secret) to win, got %+v", b.Spec.Volumes[0])
-	}
-
-	var sawEmptySkip, sawDupSkip bool
-	for _, entry := range hook.AllEntries() {
-		if strings.Contains(entry.Message, "Skipping volume with empty name") {
-			sawEmptySkip = true
-			if entry.Level != logrus.WarnLevel {
-				t.Errorf("empty-name skip should be warn-level, got %s", entry.Level)
+			resp, err := plugin.Run(volumesBuildConfigRequest(tt.strategyType, tt.strategyKey, tt.volumes))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
 			}
-		}
-		if strings.Contains(entry.Message, `Skipping duplicate volume "dup-vol"`) {
-			sawDupSkip = true
-			if entry.Level != logrus.WarnLevel {
-				t.Errorf("duplicate skip should be warn-level, got %s", entry.Level)
+
+			b := decodeBuild(t, resp)
+			if len(b.Spec.Volumes) != len(tt.wantVolumes) {
+				t.Fatalf("expected %d Build spec volumes, got %d: %+v", len(tt.wantVolumes), len(b.Spec.Volumes), b.Spec.Volumes)
 			}
-		}
-	}
-	if !sawEmptySkip {
-		t.Error("expected warn-and-skip message for empty volume name")
-	}
-	if !sawDupSkip {
-		t.Error("expected warn-and-skip message for duplicate volume name")
-	}
-}
+			for i, want := range tt.wantVolumes {
+				got := b.Spec.Volumes[i]
+				if got.Name != want.name {
+					t.Errorf("volume %d: expected name %q, got %q", i, want.name, got.Name)
+				}
+				if want.secretName != "" && (got.Secret == nil || got.Secret.SecretName != want.secretName) {
+					t.Errorf("volume %d: expected secret %q, got %+v", i, want.secretName, got.VolumeSource)
+				}
+				if want.configMapName != "" && (got.ConfigMap == nil || got.ConfigMap.Name != want.configMapName) {
+					t.Errorf("volume %d: expected configMap %q, got %+v", i, want.configMapName, got.VolumeSource)
+				}
+				// A volume carries exactly one source; the other must stay unset.
+				if want.secretName == "" && got.Secret != nil {
+					t.Errorf("volume %d: unexpected secret source %+v", i, got.Secret)
+				}
+				if want.configMapName == "" && got.ConfigMap != nil {
+					t.Errorf("volume %d: unexpected configMap source %+v", i, got.ConfigMap)
+				}
+			}
 
-func TestConvertStrategyVolumesAllSkipped(t *testing.T) {
-	logger, hook := logrustest.NewNullLogger()
-	plugin := &BuildConfigTransformPlugin{Log: logger}
-	request := volumesBuildConfigRequest("Docker", "dockerStrategy", []interface{}{
-		map[string]interface{}{
-			"name":   "csi-vol",
-			"source": map[string]interface{}{"type": "CSI", "csi": map[string]interface{}{"driver": "inline.storage.kubernetes.io"}},
-		},
-	})
-
-	resp, err := plugin.Run(request)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	b := decodeBuild(t, resp)
-	if len(b.Spec.Volumes) != 0 {
-		t.Fatalf("expected no Build spec volumes, got %+v", b.Spec.Volumes)
-	}
-
-	// When nothing was converted, neither the summary warning nor a per-volume
-	// remediation warning may be emitted — both would falsely claim success.
-	for _, entry := range hook.AllEntries() {
-		if strings.Contains(entry.Message, "Volumes were converted to Build spec volumes") {
-			t.Errorf("conversion-success warning emitted although no volume was converted: %q", entry.Message)
-		}
-		if strings.Contains(entry.Message, "add an overridable volume named") {
-			t.Errorf("per-volume remediation emitted although no volume was converted: %q", entry.Message)
-		}
+			for _, group := range tt.wantWarn {
+				entry := entryContaining(hook, group...)
+				if entry == nil {
+					t.Errorf("expected a log entry containing %q", group)
+					continue
+				}
+				if entry.Level != logrus.WarnLevel {
+					t.Errorf("entry containing %q should be warn-level, got %s", group, entry.Level)
+				}
+			}
+			for _, absent := range tt.wantAbsent {
+				if entry := entryContaining(hook, absent); entry != nil {
+					t.Errorf("no entry may contain %q, got %q", absent, entry.Message)
+				}
+			}
+			if tt.wantNoErrors {
+				isError := func(entry *logrus.Entry) bool { return entry.Level == logrus.ErrorLevel }
+				if entry := firstEntry(hook, isError); entry != nil {
+					t.Errorf("no error-level logs expected, got %q", entry.Message)
+				}
+			}
+		})
 	}
 }
 

@@ -127,6 +127,20 @@ go build -o crane-plugin-buildconfig-to-shipwright .
 
 ### 3. Test on Real Cluster
 
+The `./tests/e2e-cluster.sh` harness runs the whole flow for you — it applies
+each source BuildConfig, converts it, diffs the generated Build against a golden
+manifest, applies it, and runs a BuildRun to confirm the build succeeds:
+
+```bash
+# Full cluster E2E (needs the Minikube setup from steps above)
+./tests/e2e-cluster.sh
+
+# Verify the generated manifest only, skip the actual build
+./tests/e2e-cluster.sh --skip-build
+```
+
+The manual steps below are for custom, one-off testing.
+
 #### Minikube
 ```bash
 # Set kubectl context (context name: minikube-shipwright)

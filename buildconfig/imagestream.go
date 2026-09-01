@@ -11,7 +11,21 @@ const internalRegistryURL = "image-registry.openshift-image-registry.svc:5000"
 func resolveImageRef(kind, name, namespace string, opts PluginOptionalFields) (string, string, error) {
 	switch kind {
 	case "DockerImage":
-		return applyRegistryMapping(name, opts.RegistryMapping), "", nil
+		// A name with a "/" carries a registry or path and is a real pull spec;
+		// pass it through registry mapping unchanged. A bare name (no "/" anywhere,
+		// registry and namespace both empty, per imagepolicy.go@42e5e40:343) may have
+		// resolved on OpenShift to an ImageStream with lookupPolicy.local, which
+		// nothing on the target can do.
+		if strings.Contains(name, "/") {
+			return applyRegistryMapping(name, opts.RegistryMapping), "", nil
+		}
+		if mapped, ok := opts.ImageStreamMapping[namespace+"/"+name]; ok {
+			return applyRegistryMapping(mapped, opts.RegistryMapping), "", nil
+		}
+		if ref := applyRegistryMapping(name, opts.RegistryMapping); ref != name {
+			return ref, "", nil
+		}
+		return name, fmt.Sprintf("DockerImage reference %q in namespace %q has no registry or path. On OpenShift a name like this may have resolved to an ImageStream with lookupPolicy.local, which Shipwright cannot do. If it is an ImageStream, pass --imagestream-mapping %s/%s=<registry/image:tag>; if it is a public image, qualify the name with its registry, or list that registry in --search-registries so buildah can resolve it at build time.", name, namespace, namespace, name), nil
 
 	case "ImageStreamTag", "ImageStreamImage":
 		key := namespace + "/" + name
@@ -34,6 +48,14 @@ func resolveImageRef(kind, name, namespace string, opts PluginOptionalFields) (s
 	default:
 		return "", "", fmt.Errorf("unknown image reference kind %q for %q", kind, name)
 	}
+}
+
+// imageRegistryHost returns the registry host[:port] of an image reference —
+// everything before the first "/". A bare reference with no path returns
+// unchanged. Used to test whether an output image lives on an insecure registry.
+func imageRegistryHost(image string) string {
+	host, _, _ := strings.Cut(image, "/")
+	return host
 }
 
 func applyRegistryMapping(imageRef string, registryMapping map[string]string) string {

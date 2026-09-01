@@ -1,0 +1,40 @@
+apiVersion: shipwright.io/v1beta1
+kind: Build
+metadata:
+  annotations:
+    buildconfig-to-shipwright/conversion-outcome: converted-with-warnings
+    buildconfig-to-shipwright/original-triggers: '[{"type":"ConfigChange"}]'
+    crane.konveyor.io/conversion-warnings: |-
+      [${NAMESPACE}/${BUILD_NAME}] Output ImageStreamTag "ruby-hello-world:latest" resolved to fallback URL: ${REGISTRY}/${NAMESPACE}/ruby-hello-world:latest
+      [${NAMESPACE}/${BUILD_NAME}] Output image for ImageStreamTag "${NAMESPACE}/ruby-hello-world:latest" was redirected off the internal registry to "${REGISTRY}/${NAMESPACE}/ruby-hello-world:latest"; the ImageStream will no longer be updated, so any Deployment or DeploymentConfig watching it to roll out will stop firing.
+      [${NAMESPACE}/${BUILD_NAME}] No explicit pushSecret found for ImageStreamTag output. Ensure the BuildRun uses a ServiceAccount with internal registry push access.
+      [${NAMESPACE}/${BUILD_NAME}] BuildConfig ${BUILD_NAME} uses runPolicy "Serial", which is dropped: OpenShift queued its builds and ran them one at a time, but Shipwright BuildRuns run concurrently. Serialize the runs in your CI/CD pipeline if build ordering matters, for example when several BuildRuns push the same image tag
+      [${NAMESPACE}/${BUILD_NAME}] BuildConfig ${BUILD_NAME}: ConfigChange trigger is dropped — the automatic first build will not happen; create a BuildRun manually once to start the first build.
+      [${NAMESPACE}/${BUILD_NAME}] Found 1 trigger(s) (ConfigChange) on BuildConfig ${BUILD_NAME} — none work in Shipwright today; builds must be started manually or by your own automation.
+    crane.konveyor.io/converted-from: build.openshift.io/v1/BuildConfig/${BUILD_NAME}
+  labels:
+    app: ruby-hello-world
+    build-type: docker
+  name: ${BUILD_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  output:
+    image: ${REGISTRY}/${NAMESPACE}/ruby-hello-world:latest
+  paramValues:
+  - configMapValue: null
+    name: dockerfile
+    secretValue: null
+    value: Dockerfile
+  - name: registries-insecure
+    values:
+    - configMapValue: null
+      secretValue: null
+      value: ${REGISTRY}
+  source:
+    git:
+      revision: master
+      url: https://github.com/openshift/ruby-hello-world.git
+    type: Git
+  strategy:
+    kind: ClusterBuildStrategy
+    name: ${BUILD_STRATEGY}
