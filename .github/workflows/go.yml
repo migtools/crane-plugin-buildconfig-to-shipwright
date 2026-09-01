@@ -80,4 +80,4 @@ jobs:
           GOPROXY: "https://proxy.golang.org"
         run: |
           cd tests
-          go test ./e2e -v --project-root=..
+          go test ./e2e -v
