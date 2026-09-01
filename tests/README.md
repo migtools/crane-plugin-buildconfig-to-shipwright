@@ -1,47 +1,18 @@
 # BuildConfig to Shipwright Plugin Tests
 
-Minimal E2E test suite for validating BuildConfig → Shipwright Build conversion.
+Focused unit test suite for validating BuildConfig → Shipwright Build conversion.
 
 ## Approach
 
-**Direct plugin execution** - No crane binary needed!
+**Direct plugin execution** - No crane binary or cluster needed!
 
 ```
-YAML file → Parse → Plugin.Run() → Validate → ✅
+BuildConfig YAML → Parse → plugin.Run() → Validate Rules → ✅
 ```
 
-Tests call the plugin directly as a Go library (not via crane).
+Tests call the plugin directly as a Go library, validating conversion logic against declarative YAML rules.
 
----
-
-## Structure
-
-```
-tests/
-├── framework/           # ~230 LOC
-│   ├── plugin.go        # Direct plugin execution
-│   └── validation.go    # Conversion rule validators
-├── e2e/                 # ~100 LOC  
-│   ├── e2e_suite_test.go       # Ginkgo setup
-│   └── conversion_test.go      # DescribeTable with 18 tests
-└── testdata/            # 18 BuildConfig YAML files
-    ├── 01-datagrid-hotrod.yaml
-    └── ...
-```
-
-**Total:** ~440 lines of Go code
-
----
-
-## Prerequisites
-
-- **Go 1.22+**
-- **No cluster needed**
-- **No crane binary needed**
-
----
-
-## Running Tests
+## Quick Start
 
 ```bash
 cd tests
@@ -52,27 +23,84 @@ go test ./e2e -v
 # Run single test
 go test ./e2e -v -ginkgo.focus="docker-and-s2i"
 
-# Run with project root override
-go test ./e2e -v --project-root=/path/to/plugin
+# With Ginkgo
+ginkgo tests/e2e/ -v
 ```
 
----
+**Speed:** ~0.012 seconds for 20 tests  
+**Requirements:** Go 1.22+ only (no crane, no cluster)
 
-## Test Pattern
+## Structure
+
+```
+tests/
+├── framework/              # ~750 LOC
+│   ├── plugin.go           # Direct plugin execution
+│   ├── rules.go            # YAML rule loading
+│   ├── rule_evaluator.go   # Type-safe rule evaluation
+│   └── validation.go       # Conversion validation + golden file support
+├── e2e/                    # ~90 LOC  
+│   ├── e2e_suite_test.go   # Ginkgo setup
+│   └── conversion_test.go  # DescribeTable with 20 test cases
+├── testdata/               # 20 BuildConfig YAML files
+│   ├── 01-datagrid-hotrod.yaml
+│   ├── ...
+│   ├── 19-docker-imagestream-ruby.yaml      # From PR#60
+│   └── 20-s2i-imagestream-nodejs.yaml       # From PR#60
+└── rules.yaml              # 13 declarative conversion rules
+```
+
+## Test Coverage
+
+### 20 Test Cases
+
+**18 from real-world scenarios (issues #833-#850):**
+- Docker + S2I combinations
+- Environment variables and volumes
+- Pull secrets and proxies
+- Post-commit hooks
+- Service account overrides
+- No-cache builds
+- ImageSource cross-namespace
+
+**2 from PR#60 cluster tests:**
+- Docker + ImageStream (Ruby)
+- S2I + ImageStream (Node.js)
+
+### 13 Validation Rules
+
+Defined declaratively in `rules.yaml`:
+
+1. **API Version** - Must be `shipwright.io/v1beta1`
+2. **Strategy Mapping**
+   - Docker → buildah
+   - Source → source-to-image
+   - JenkinsPipeline/Custom → skipped
+3. **Annotations**
+   - `crane.konveyor.io/converted-from`
+   - Conversion outcome tracking
+4. **Field Mappings**
+   - Git source (URI, ref, contextDir)
+   - Output image
+   - Dockerfile path
+   - Timeouts and retention
+5. **Labels Preservation**
+6. **Triggers** - Preserved in annotations
+7. **Environment Variables** - Preserved
+8. **Volumes** - Preserved
+
+## What's Tested
 
 Each test:
-1. **Parses YAML** file into resources
-2. **Calls plugin** directly: `plugin.Run(BuildConfig)`
-3. **Extracts Build** resources from response
-4. **Validates** against conversion rules:
-   - API version (shipwright.io/v1beta1)
-   - Strategy mapping (Docker → buildah, S2I → source-to-image)
-   - Annotations (crane.konveyor.io/*, conversion-outcome)
-   - Git source mapping
-   - Output image mapping
-   - Labels preservation
+1. Parses BuildConfig YAML
+2. Calls `plugin.Run()` directly
+3. Extracts generated Build resources
+4. Validates against all 13 rules
+5. Reports violations with clear error messages
 
----
+**Skip handling:**
+- ✅ JenkinsPipeline BuildConfigs return no Build
+- ✅ Custom strategy BuildConfigs return no Build
 
 ## Example Output
 
@@ -80,104 +108,61 @@ Each test:
 Running Suite: BuildConfig to Shipwright Conversion Suite
 ==========================================================
 
-• [#833] datagrid-hotrod [FAILED] [0.001s]
-• [#834] cakephp-mysql [FAILED] [0.001s]  
 ✓ [#835] docker-and-s2i [PASSED] [0.001s]
 ✓ [#836] webapp-docker [PASSED] [0.001s]
 ✓ [#837] api-s2i [PASSED] [0.001s]
 ✓ [#838] jenkins-pipeline (skipped) [PASSED] [0.001s]
-✓ [#839] custom-strategy (skipped) [PASSED] [0.001s]
+✓ [PR#60] docker-imagestream-ruby [PASSED] [0.001s]
+✓ [PR#60] s2i-imagestream-nodejs [PASSED] [0.001s]
 ...
 
-Ran 18 of 18 Specs in 0.012 seconds
-SUCCESS! -- 10 Passed | 8 Failed | 0 Pending | 0 Skipped
+Ran 20 of 20 Specs in 0.012 seconds
+SUCCESS! -- 12 Passed | 8 Failed | 0 Pending | 0 Skipped
 ```
-
-**Speed:** 0.012 seconds for 18 tests (vs 13+ seconds with crane integration)
-
----
-
-## Test Results
-
-### Passing (10/18)
-- ✅ docker-and-s2i
-- ✅ webapp-docker
-- ✅ api-s2i
-- ✅ jenkins-pipeline (correctly skipped)
-- ✅ custom-strategy (correctly skipped)
-- ✅ docker-with-envvars
-- ✅ s2i-with-envvars
-- ✅ docker-with-volumes
-- ✅ docker-nocache
-- ✅ serviceaccount-override
-
-### Failing (8/18)
-These contain OpenShift Templates or incomplete BuildConfigs (expected):
-- ❌ datagrid-hotrod (Template - needs preprocessing)
-- ❌ cakephp-mysql (Template - needs preprocessing)
-- ❌ pullsecret-nodejs (incomplete)
-- ❌ generic-test-build (incomplete)
-- ❌ docker-postcommit (incomplete)
-- ❌ build-with-proxy (incomplete)
-- ❌ imagesource-cross-namespace (incomplete)
-- ❌ s2i-with-volumes (incomplete)
-
----
-
-## What's Validated
-
-### Core Conversion Rules
-1. ✅ **API Version** - Must be `shipwright.io/v1beta1`
-2. ✅ **Strategy Mapping**
-   - Docker → buildah
-   - Source → source-to-image
-   - JenkinsPipeline → skipped
-   - Custom → skipped
-3. ✅ **Annotations**
-   - `crane.konveyor.io/converted-from` 
-   - `buildconfig-to-shipwright/conversion-outcome`
-4. ✅ **Git Source** - URI, ref, contextDir preserved
-5. ✅ **Output Image** - Mapped correctly
-6. ✅ **Labels** - All preserved
-
-### Skip Handling
-- ✅ JenkinsPipeline BuildConfigs return no Build
-- ✅ Custom strategy BuildConfigs return no Build
-
----
 
 ## Adding New Tests
 
+### 1. Add BuildConfig YAML
+
 ```bash
-# 1. Add BuildConfig YAML to testdata/
-cp my-buildconfig.yaml testdata/19-my-test.yaml
+cp my-buildconfig.yaml testdata/21-my-test.yaml
+```
 
-# 2. Add Entry to conversion_test.go
-Entry("[#851] my-test", "19-my-test.yaml", "851", "my-test"),
+### 2. Add Test Entry
 
-# 3. Run test
+Edit `e2e/conversion_test.go`:
+
+```go
+Entry("[#851] my-test", "21-my-test.yaml", "851", "description"),
+```
+
+### 3. Run Test
+
+```bash
 go test ./e2e -v -ginkgo.focus="my-test"
 ```
 
----
+## Extending Validation
 
-## Extending Validation Rules
+### Add New Rule to rules.yaml
 
-```go
-// framework/validation.go
-
-// Add new rule in ValidateConversion()
-if someCondition {
-    violations = append(violations, RuleViolation{
-        Rule:        "RULE-8",
-        Description: "Your new rule",
-        Expected:    "expected value",
-        Actual:      actualValue,
-    })
-}
+```yaml
+- id: RULE-14
+  name: My New Rule
+  description: Validates something important
+  type: field_equals
+  field: build.spec.something
+  expected: expected-value
 ```
 
----
+### Add New Rule Type
+
+If you need a new rule type, add evaluator in `framework/rule_evaluator.go`:
+
+```go
+case "my_new_type":
+    return evaluateMyNewType(rule, bc, build)
+```
 
 ## CI Integration
 
@@ -195,30 +180,89 @@ jobs:
         with:
           go-version: '1.22'
       
-      - name: Run tests
-        working-directory: tests
-        run: go test ./e2e -v
+      - name: Run Unit Tests
+        run: go test ./tests/e2e -v
 ```
 
-**No crane binary needed in CI!**
-
----
+**No dependencies needed in CI** - just Go!
 
 ## Benefits
 
-✅ **Simple** - 440 LOC vs 700+ LOC with crane integration  
-✅ **Fast** - 0.012s vs 13+ seconds  
-✅ **No dependencies** - No crane binary, no fake export  
-✅ **Easy debugging** - Direct function calls  
-✅ **Same validation** - All rule checking intact  
-
----
+✅ **Fast** - 0.012s vs minutes with crane/cluster  
+✅ **Simple** - No crane binary, no cluster setup  
+✅ **Focused** - Tests plugin logic, not crane workflow  
+✅ **Maintainable** - YAML rules instead of hard-coded checks  
+✅ **Type-safe** - Go evaluation, not bash string matching  
+✅ **Comprehensive** - 20 test cases, 13 validation rules  
 
 ## What's NOT Tested
 
-This test suite focuses on **plugin conversion logic**. It does NOT test:
-- ❌ crane export/transform/apply workflow (that's crane's responsibility)
-- ❌ Plugin loading mechanism (that's crane's responsibility)  
-- ❌ Multi-plugin orchestration (that's crane's responsibility)
+This framework focuses on **plugin conversion correctness**. It does NOT test:
 
-For full integration testing, see crane's E2E tests.
+- ❌ crane CLI workflow (export/transform/apply)
+- ❌ Plugin loading mechanism  
+- ❌ Actual image builds on cluster
+- ❌ BuildRun execution
+
+**For integration testing:** Use crane's E2E tests or the bash scripts in this repo (`e2e-cluster.sh`, `e2e-transform.sh`).
+
+## Relationship to PR#60
+
+PR#60 added cluster-based integration tests (Bash scripts). This framework:
+- **Complements** those tests (unit vs integration)
+- **Includes** their test cases (#19, #20) as unit tests
+- **Validates** conversion logic they depend on
+- **Runs faster** for development iteration
+
+Both are valuable:
+- **Unit tests (this):** Fast feedback on conversion logic
+- **Cluster tests (PR#60):** Full workflow validation
+
+## Test Results
+
+### Currently Passing (12/20)
+- ✅ docker-and-s2i
+- ✅ webapp-docker
+- ✅ api-s2i
+- ✅ jenkins-pipeline (correctly skipped)
+- ✅ custom-strategy (correctly skipped)
+- ✅ docker-with-envvars
+- ✅ s2i-with-envvars
+- ✅ docker-with-volumes
+- ✅ docker-nocache
+- ✅ serviceaccount-override
+- ✅ docker-imagestream-ruby (from PR#60)
+- ✅ s2i-imagestream-nodejs (from PR#60)
+
+### Currently Failing (8/20)
+Templates or incomplete BuildConfigs (expected):
+- ❌ datagrid-hotrod (Template)
+- ❌ cakephp-mysql (Template)
+- ❌ pullsecret-nodejs (incomplete)
+- ❌ generic-test-build (incomplete)
+- ❌ docker-postcommit (incomplete)
+- ❌ build-with-proxy (incomplete)
+- ❌ imagesource-cross-namespace (incomplete)
+- ❌ s2i-with-volumes (incomplete)
+
+## Troubleshooting
+
+### Tests Fail
+
+1. Check error message for which rule failed
+2. Compare expected vs actual values
+3. Fix plugin code or update rule definition
+
+### Rule Definition Issues
+
+- Verify YAML syntax in `rules.yaml`
+- Check field paths use dot notation correctly
+- Ensure rule type exists in `rule_evaluator.go`
+
+### Plugin Build Issues
+
+```bash
+# Ensure plugin builds
+cd ..
+go build .
+```

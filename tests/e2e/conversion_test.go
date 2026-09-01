@@ -80,5 +80,7 @@ var _ = Describe("BuildConfig to Shipwright Conversion", func() {
 		Entry("[#848] imagesource-cross-namespace", "16-imagesource-cross-namespace.yaml", "848", "imagesource-cross-namespace"),
 		Entry("[#849] docker-nocache", "17-docker-nocache.yaml", "849", "docker-nocache"),
 		Entry("[#850] serviceaccount-override", "18-serviceaccount-override.yaml", "850", "serviceaccount-override"),
+		Entry("[PR#60] docker-imagestream-ruby", "19-docker-imagestream-ruby.yaml", "PR60", "docker-imagestream-ruby from dev's cluster tests"),
+		Entry("[PR#60] s2i-imagestream-nodejs", "20-s2i-imagestream-nodejs.yaml", "PR60", "s2i-imagestream-nodejs from dev's cluster tests"),
 	)
 })
