@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -16,7 +17,7 @@ var _ = Describe("BuildConfig to Shipwright Conversion", func() {
 	DescribeTable("should convert BuildConfig to Shipwright Build correctly",
 		func(testFile, issueNumber, description string) {
 			// Setup paths
-			testDataPath := filepath.Join(projectRoot, "tests", "testdata", testFile)
+			testDataPath := filepath.Join(projectRoot, "tests", "testdata", "buildconfig_yamls", testFile)
 
 			// Check if this test expects the BuildConfig to be skipped
 			shouldSkip := strings.Contains(description, "should skip")
@@ -46,6 +47,7 @@ var _ = Describe("BuildConfig to Shipwright Conversion", func() {
 			// Step 2: Validate each generated Build against conversion rules
 			By(fmt.Sprintf("Validating %d generated Build(s)", len(builds)))
 			for _, buildObj := range builds {
+				// Rule-based validation
 				violations, err := framework.ValidateConversion(projectRoot, testDataPath, buildObj)
 				Expect(err).NotTo(HaveOccurred())
 
@@ -57,6 +59,24 @@ var _ = Describe("BuildConfig to Shipwright Conversion", func() {
 					}
 					Fail(fmt.Sprintf("Conversion rule violations found:\n  - %s",
 						strings.Join(msgs, "\n  - ")))
+				}
+
+				// Golden file comparison (if expected output exists)
+				expectedFile := strings.TrimSuffix(testFile, ".yaml") + "-expected.yaml"
+				expectedPath := filepath.Join(projectRoot, "tests", "testdata", "expected_output", expectedFile)
+
+				if _, err := os.Stat(expectedPath); err == nil {
+					By(fmt.Sprintf("Comparing with golden file: %s", expectedFile))
+
+					// No variable expansion needed for our tests
+					vars := map[string]string{}
+					diffs, err := framework.CompareWithGoldenFile(buildObj, expectedPath, vars)
+					Expect(err).NotTo(HaveOccurred())
+
+					if len(diffs) > 0 {
+						Fail(fmt.Sprintf("Build differs from expected output:\n  %s",
+							strings.Join(diffs, "\n  ")))
+					}
 				}
 			}
 		},

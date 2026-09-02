@@ -1,0 +1,50 @@
+apiVersion: shipwright.io/v1beta1
+kind: Build
+metadata:
+  annotations:
+    buildconfig-to-shipwright/conversion-outcome: converted-with-warnings
+    buildconfig-to-shipwright/inline-dockerfile-configmap: mydockertest-dockerfile
+    crane.konveyor.io/conversion-warnings: |-
+      [/mydockertest] Inline Dockerfile on BuildConfig /mydockertest cannot be consumed by the buildah strategy; its content was preserved in ConfigMap /mydockertest-dockerfile (key Dockerfile). Commit it to the source repository as the Dockerfile, or see https://issues.redhat.com/browse/BUILD-1495, before running the Build.
+      [/mydockertest] No source type specified for BuildConfig: mydockertest
+      [/mydockertest] Output ImageStreamTag "test:latest" resolved to fallback URL: image-registry.openshift-image-registry.svc:5000//test:latest
+      [/mydockertest] No explicit pushSecret found for ImageStreamTag output. Ensure the BuildRun uses a ServiceAccount with internal registry push access.
+      [/mydockertest] BuildConfig mydockertest uses runPolicy "Serial", which is dropped: OpenShift queued its builds and ran them one at a time, but Shipwright BuildRuns run concurrently. Serialize the runs in your CI/CD pipeline if build ordering matters, for example when several BuildRuns push the same image tag
+    crane.konveyor.io/converted-from: build.openshift.io/v1/BuildConfig/mydockertest
+  labels:
+    name: test
+  name: mydockertest
+spec:
+  env:
+  - name: BUILD_LOGLEVEL
+    value: "5"
+  - name: FIELDREF_ENV
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: CONFIGMAPKEYREF_ENV
+    valueFrom:
+      configMapKeyRef:
+        key: mykey
+        name: myconfigmap
+  - name: SECRETKEYREF_ENV
+    valueFrom:
+      secretKeyRef:
+        key: username
+        name: mysecret
+  - name: FIELDREF_CLONE_ENV
+    value: $(FIELDREF_ENV)
+  - name: FIELDREF_CLONE_CLONE_ENV
+    value: $(FIELDREF_CLONE_ENV)
+  - name: UNAVAILABLE_ENV
+    value: $(SOME_OTHER_ENV)
+  - name: ESCAPED_ENV
+    value: $$(MY_ESCAPED_VALUE)
+  output:
+    image: image-registry.openshift-image-registry.svc:5000//test:latest
+    labels:
+      user-specified-label: arbitrary-value
+  source: null
+  strategy:
+    kind: ClusterBuildStrategy
+    name: buildah

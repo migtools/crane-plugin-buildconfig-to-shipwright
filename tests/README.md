@@ -42,11 +42,16 @@ tests/
 ├── e2e/                    # ~90 LOC  
 │   ├── e2e_suite_test.go   # Ginkgo setup
 │   └── conversion_test.go  # DescribeTable with 20 test cases
-├── testdata/               # 20 BuildConfig YAML files
-│   ├── 01-datagrid-hotrod.yaml
-│   ├── ...
-│   ├── 19-docker-imagestream-ruby.yaml      # From PR#60
-│   └── 20-s2i-imagestream-nodejs.yaml       # From PR#60
+├── testdata/
+│   ├── buildconfig_yamls/  # 20 BuildConfig test inputs
+│   │   ├── 01-datagrid-hotrod.yaml
+│   │   ├── ...
+│   │   ├── 19-docker-imagestream-ruby.yaml   # From PR#60
+│   │   └── 20-s2i-imagestream-nodejs.yaml    # From PR#60
+│   └── expected_output/    # 10 expected Build outputs
+│       ├── 03-docker-and-s2i-expected.yaml
+│       ├── 04-webapp-docker-expected.yaml
+│       └── ...
 └── rules.yaml              # 13 declarative conversion rules
 ```
 
@@ -66,6 +71,14 @@ tests/
 **2 from PR#60 cluster tests:**
 - Docker + ImageStream (Ruby)
 - S2I + ImageStream (Node.js)
+
+### Two-Level Validation
+
+**1. Rule-Based Validation (13 rules):**
+All tests validate against declarative rules in `rules.yaml`
+
+**2. Golden File Comparison (10 tests):**
+Tests with expected outputs in `expected_output/` also compare complete YAML
 
 ### 13 Validation Rules
 

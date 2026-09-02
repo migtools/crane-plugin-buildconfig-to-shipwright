@@ -1,0 +1,45 @@
+apiVersion: shipwright.io/v1beta1
+kind: Build
+metadata:
+  annotations:
+    buildconfig-to-shipwright/conversion-outcome: converted-with-warnings
+    crane.konveyor.io/conversion-warnings: |-
+      [myapp/webapp-docker] Volume "build-certs" was converted, but the Build will fail validation (reason: UndefinedVolume) until you: (1) add an overridable volume named 'build-certs' to your ClusterBuildStrategy copy — volumes: [{name: build-certs, overridable: true, emptyDir: {}}] (placeholder source; the converted Build's override supplies the real Secret/ConfigMap), (2) add a volumeMount for 'build-certs' on the strategy build step (original BuildConfig destination paths: /etc/pki/ca-trust/source/anchors), (3) point the Build at the strategy copy via spec.strategy.name. See docs/volume-migration.md in the crane-plugin-buildconfig-to-shipwright repository.
+      [myapp/webapp-docker] Volumes were converted to Build spec volumes, but the shipped Buildah ClusterBuildStrategy does not declare them: Shipwright will reject the Build (Registered=False, reason: UndefinedVolume) until a matching volume with 'overridable: true' is added to a copy of the strategy. See docs/volume-migration.md in the crane-plugin-buildconfig-to-shipwright repository.
+      [myapp/webapp-docker] BuildConfig webapp-docker uses runPolicy "Serial", which is dropped: OpenShift queued its builds and ran them one at a time, but Shipwright BuildRuns run concurrently. Serialize the runs in your CI/CD pipeline if build ordering matters, for example when several BuildRuns push the same image tag
+    crane.konveyor.io/converted-from: build.openshift.io/v1/BuildConfig/webapp-docker
+  labels:
+    app: webapp
+  name: webapp-docker
+  namespace: myapp
+spec:
+  output:
+    image: quay.io/example/webapp:latest
+    pushSecret: quay-push-secret
+  paramValues:
+  - configMapValue: null
+    name: dockerfile
+    secretValue: null
+    value: Dockerfile.prod
+  - name: build-args
+    values:
+    - configMapValue: null
+      secretValue: null
+      value: GO_VERSION=1.21
+    - configMapValue: null
+      secretValue: null
+      value: BASE_IMAGE=registry.access.redhat.com/ubi8/ubi-minimal:latest
+  source:
+    contextDir: docker
+    git:
+      cloneSecret: git-credentials
+      revision: main
+      url: https://github.com/example/webapp.git
+    type: Git
+  strategy:
+    kind: ClusterBuildStrategy
+    name: buildah
+  volumes:
+  - name: build-certs
+    secret:
+      secretName: build-certs
