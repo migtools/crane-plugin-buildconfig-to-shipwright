@@ -1,8 +1,0 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: app-config
-  namespace: myapp
-data:
-  DATABASE_URL: postgresql://db:5432/myapp
-  LOG_LEVEL: info

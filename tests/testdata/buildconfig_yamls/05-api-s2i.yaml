@@ -2,7 +2,7 @@ apiVersion: build.openshift.io/v1
 kind: BuildConfig
 metadata:
   name: api-s2i
-  namespace: myapp
+  namespace: bc-test-05-api-s2i
   labels:
     app: api
 spec:

@@ -1,0 +1,207 @@
+# BuildConfig to Shipwright Build Conversion Rules
+# Each rule validates one aspect of the conversion
+# Source: buildconfig-to-shipwright-conversion-rules.md
+
+rules:
+  # ═══════════════════════════════════════════════════════════════════
+  # Basic Conversion Rules
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: RULE-1
+    name: API Version
+    description: Build must use shipwright.io/v1beta1
+    type: field_equals
+    field: build.apiVersion
+    expected: shipwright.io/v1beta1
+
+  - id: RULE-2a
+    name: Docker Strategy Mapping
+    description: Docker BuildConfig strategy must map to buildah
+    type: conditional_mapping
+    when:
+      field: bc.spec.strategy.type
+      equals: Docker
+    then:
+      field: build.spec.strategy.name
+      expected: buildah
+
+  - id: RULE-2b
+    name: S2I Strategy Mapping
+    description: Source BuildConfig strategy must map to source-to-image
+    type: conditional_mapping
+    when:
+      field: bc.spec.strategy.type
+      equals: Source
+    then:
+      field: build.spec.strategy.name
+      expected: source-to-image
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Annotations
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: RULE-3
+    name: Conversion Source Annotation
+    description: Build must have crane.konveyor.io/converted-from annotation
+    type: annotation_pattern
+    annotation: crane.konveyor.io/converted-from
+    pattern: "build.openshift.io/v1/BuildConfig/{bc.name}"
+
+  - id: RULE-4
+    name: Conversion Outcome Annotation
+    description: Build must have conversion-outcome annotation
+    type: annotation_exists
+    annotation: buildconfig-to-shipwright/conversion-outcome
+    allowed_values:
+      - converted
+      - converted-with-warnings
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Source Configuration
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: RULE-5a
+    name: Git Source URL
+    description: Git URI must be preserved as url
+    type: field_mapping
+    bc_field: bc.spec.source.git.uri
+    build_field: build.spec.source.git.url
+    when_bc_field_present: bc.spec.source.git.uri
+
+  - id: RULE-5b
+    name: Git Source Ref
+    description: Git ref must be preserved as revision
+    type: field_mapping
+    bc_field: bc.spec.source.git.ref
+    build_field: build.spec.source.git.revision
+    when_bc_field_present: bc.spec.source.git.ref
+
+  - id: RULE-5c
+    name: Git Context Directory
+    description: Context directory must be preserved
+    type: field_mapping
+    bc_field: bc.spec.source.contextDir
+    build_field: build.spec.source.contextDir
+    when_bc_field_present: bc.spec.source.contextDir
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Output Configuration
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: RULE-6
+    name: DockerImage Output Mapping
+    description: DockerImage output must be preserved as image
+    type: conditional_mapping
+    when:
+      field: bc.spec.output.to.kind
+      equals: DockerImage
+    then:
+      field: build.spec.output.image
+      equals_bc_field: bc.spec.output.to.name
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Labels
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: RULE-7
+    name: Labels Preservation
+    description: All BuildConfig labels must be preserved
+    type: labels_preserved
+    bc_labels: bc.metadata.labels
+    build_labels: build.metadata.labels
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Triggers (Dropped, Preserved in Annotation)
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: RULE-8a
+    name: Triggers Preserved in Annotation
+    description: Triggers must be preserved in annotation if present in BC
+    type: triggers_annotation
+    when_bc_field_present: bc.spec.triggers
+    annotation: buildconfig-to-shipwright/original-triggers
+
+  - id: RULE-8b
+    name: Triggers Dropped from Spec
+    description: Triggers must not appear in Build spec
+    type: field_absent
+    field: build.spec.triggers
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PostCommit (Dropped with Warning)
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: RULE-9
+    name: PostCommit Dropped
+    description: PostCommit must not appear in Build spec
+    type: field_absent
+    field: build.spec.postCommit
+
+  # ═══════════════════════════════════════════════════════════════════
+  # RunPolicy (Dropped with Warning for Serial/SerialLatestOnly)
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: RULE-10a
+    name: RunPolicy Dropped
+    description: RunPolicy must not appear in Build spec
+    type: field_absent
+    field: build.spec.runPolicy
+
+  - id: RULE-10b
+    name: RunPolicy Warning Annotation
+    description: Serial/SerialLatestOnly runPolicy must generate warning
+    type: conditional_annotation
+    when:
+      field: bc.spec.runPolicy
+      in_values:
+        - Serial
+        - SerialLatestOnly
+    then:
+      annotation: buildconfig-to-shipwright/conversion-outcome
+      expected: converted-with-warnings
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Retention Limits
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: RULE-11a
+    name: Successful Builds History Limit
+    description: successfulBuildsHistoryLimit must map to retention.succeededLimit
+    type: retention_limit
+    bc_field: bc.spec.successfulBuildsHistoryLimit
+    build_field: build.spec.retention.succeededLimit
+    min: 1
+    max: 10000
+
+  - id: RULE-11b
+    name: Failed Builds History Limit
+    description: failedBuildsHistoryLimit must map to retention.failedLimit
+    type: retention_limit
+    bc_field: bc.spec.failedBuildsHistoryLimit
+    build_field: build.spec.retention.failedLimit
+    min: 1
+    max: 10000
+
+  # ═══════════════════════════════════════════════════════════════════
+  # NodeSelector
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: RULE-12
+    name: NodeSelector Preservation
+    description: NodeSelector must be preserved if valid
+    type: field_mapping
+    bc_field: bc.spec.nodeSelector
+    build_field: build.spec.nodeSelector
+    when_bc_field_present: bc.spec.nodeSelector
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Timeout
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: RULE-13
+    name: Timeout Mapping
+    description: completionDeadlineSeconds must map to timeout.duration
+    type: timeout_mapping
+    bc_field: bc.spec.completionDeadlineSeconds
+    build_field: build.spec.timeout.duration
+    when_bc_field_present: bc.spec.completionDeadlineSeconds

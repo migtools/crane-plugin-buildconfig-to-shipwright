@@ -1,0 +1,26 @@
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: nocache-test-build
+  namespace: buildconfig-demo
+  labels:
+    app: nocache-test
+spec:
+  output:
+    to:
+      kind: ImageStreamTag
+      name: nocache-test:latest
+  source:
+    type: Git
+    git:
+      uri: https://github.com/openshift/ruby-hello-world.git
+      ref: master
+    contextDir: "."
+  strategy:
+    type: Docker
+    dockerStrategy:
+      noCache: true
+      forcePull: true
+      dockerfilePath: Dockerfile
+  triggers:
+    - type: ConfigChange

@@ -3,3 +3,32 @@ repo.md
 
 # Design docs and TRACKER.md are per-author working notes, not project artifacts.
 designs/
+
+# Built binaries
+crane-plugin-buildconfig-to-shipwright
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+tests/testdata/export/
+*.test
+*.out
+coverage.txt
+*.prof
+
+# Go build cache
+vendor/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.log

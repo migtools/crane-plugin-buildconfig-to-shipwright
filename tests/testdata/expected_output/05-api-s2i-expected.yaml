@@ -1,0 +1,41 @@
+apiVersion: shipwright.io/v1beta1
+kind: Build
+metadata:
+  annotations:
+    buildconfig-to-shipwright/conversion-outcome: converted-with-warnings
+    crane.konveyor.io/conversion-warnings: |-
+      [bc-test-05-api-s2i/api-s2i] ImageStream reference "nodejs:16-ubi8" in namespace "openshift" could not be resolved — no --imagestream-mapping provided. Using fallback: image-registry.openshift-image-registry.svc:5000/openshift/nodejs:16-ubi8. Provide --imagestream-mapping to set the correct image reference.
+      [bc-test-05-api-s2i/api-s2i] Volume "app-config" was converted, but the Build will fail validation (reason: UndefinedVolume) until you: (1) add an overridable volume named 'app-config' to your ClusterBuildStrategy copy — volumes: [{name: app-config, overridable: true, emptyDir: {}}] (placeholder source; the converted Build's override supplies the real Secret/ConfigMap), (2) add a volumeMount for 'app-config' on the strategy build step (original BuildConfig destination paths: /etc/app-config), (3) point the Build at the strategy copy via spec.strategy.name. See docs/volume-migration.md in the crane-plugin-buildconfig-to-shipwright repository.
+      [bc-test-05-api-s2i/api-s2i] Volumes were converted to Build spec volumes, but the shipped Source-to-Image ClusterBuildStrategy does not declare them: Shipwright will reject the Build (Registered=False, reason: UndefinedVolume) until a matching volume with 'overridable: true' is added to a copy of the strategy. See docs/volume-migration.md in the crane-plugin-buildconfig-to-shipwright repository.
+      [bc-test-05-api-s2i/api-s2i] Output ImageStreamTag "api-service:latest" resolved to fallback URL: image-registry.openshift-image-registry.svc:5000/bc-test-05-api-s2i/api-service:latest
+      [bc-test-05-api-s2i/api-s2i] No explicit pushSecret found for ImageStreamTag output. Ensure the BuildRun uses a ServiceAccount with internal registry push access.
+      [bc-test-05-api-s2i/api-s2i] BuildConfig api-s2i uses runPolicy "Serial", which is dropped: OpenShift queued its builds and ran them one at a time, but Shipwright BuildRuns run concurrently. Serialize the runs in your CI/CD pipeline if build ordering matters, for example when several BuildRuns push the same image tag
+    crane.konveyor.io/converted-from: build.openshift.io/v1/BuildConfig/api-s2i
+  labels:
+    app: api
+  name: api-s2i
+  namespace: bc-test-05-api-s2i
+spec:
+  env:
+  - name: NPM_MIRROR
+    value: https://registry.npmjs.org
+  output:
+    image: image-registry.openshift-image-registry.svc:5000/bc-test-05-api-s2i/api-service:latest
+  paramValues:
+  - configMapValue: null
+    name: builder-image
+    secretValue: null
+    value: image-registry.openshift-image-registry.svc:5000/openshift/nodejs:16-ubi8
+  source:
+    contextDir: src
+    git:
+      revision: release-2.0
+      url: https://github.com/example/api-service.git
+    type: Git
+  strategy:
+    kind: ClusterBuildStrategy
+    name: source-to-image
+  volumes:
+  - configMap:
+      name: app-config
+    name: app-config
