@@ -113,8 +113,8 @@ skip it.**
 | An `Outcome*` state or a `*Annotation` constant, or a change to what a passed-through BuildConfig carries (`passThroughWithDisposition`) | `docs/support-matrix.md` › How to read this page, What the plugin writes; `docs/architecture.md` › Outcomes, and where they are recorded; `README.md` › What it does, Conversion example (its output YAML); `AGENTS.md` › How it works (the per-resource list of what the plugin returns) | `TestSupportMatrixCoversEveryWarning` (constants clause) |
 | A non-test Go file added, deleted, or renamed; a `process*` method on `Converter` added, removed, or renamed; a change to the call order inside `Convert` | `docs/architecture.md` › The conversion, step by step, The files; `AGENTS.md` › the file lists under "Files you may own fully" and "Files where the maintainer reads your diff line by line" (once PR #71 lands) | `TestArchitectureDocNamesEveryFileAndStage`, `TestArchitectureDocSymbolsExist` |
 | A `Test*` function removed or renamed | `docs/architecture.md` › Rules that must stay true (each rule cites the test that keeps it) | `TestInvariantsCiteRealTests` |
-| A new test guarding a doc (`*_doc_test.go`, `readme_test.go`, `support_matrix_test.go`, `adr_test.go`, `examples_test.go`) | `AGENTS.md` › When a documentation test fails (one row per test, once PR #71 lands) | none |
-| Any change that moves what the plugin emits for an input (`processOutput`, `processSource`, `generateServiceAccount`, `toUnstructured`, `stripSerializationNoise`, an annotation, a name) | `docs/examples/<x>/expected/` regenerated **after approval** with `go test ./buildconfig -run TestExamplesMatchCommittedOutput -update`, then that example's `README.md` re-read and re-proposed; `README.md` › Conversion example (its output YAML) | `TestExamplesMatchCommittedOutput` |
+| A new test guarding a doc (`*_doc_test.go`) | `AGENTS.md` › When a documentation test fails (one row per test, once PR #71 lands) | none |
+| Any change that moves what the plugin emits for an input (`processOutput`, `processSource`, `generateServiceAccount`, `toUnstructured`, `stripSerializationNoise`, an annotation, a name) | `docs/examples/<x>/expected/` regenerated **after approval** with `go test -tags documentation ./buildconfig -run TestExamplesMatchCommittedOutput -update`, then that example's `README.md` re-read and re-proposed; `README.md` › Conversion example (its output YAML) | `TestExamplesMatchCommittedOutput` |
 | A rule the code must keep obeying was decided in the design doc or the PR (never overwrite X, always warn on Y, one path for Z) | new `docs/adr/NNNN-<slug>.md` with the same parts as its siblings, a row in `docs/adr/README.md`, and the rule in `docs/architecture.md` › Rules that must stay true | `TestADRsAreWellFormed` (shape only; nothing checks that a decision got a record) |
 | The strategy switch in `converter.go` (`Docker`, `Source`, `Custom`, `JenkinsPipeline`), or the output gate | `README.md` › Strategy support and What it does; `AGENTS.md` › How it works; `docs/support-matrix.md` › What stops a BuildConfig from converting | none |
 | `processStrategyVolumes`, `convertBuildVolumeSource`, the `UndefinedVolume` warning, the `:ro` mount text | `docs/volume-migration.md`; `docs/support-matrix.md` › the volumes rows | `TestSupportMatrixCoversEveryWarning` for the warning text |
@@ -189,14 +189,11 @@ git ls-files '*.md' \
   | grep -vE '^(designs/|\.claude/|CLAUDE\.md$|README\.md$|AGENTS\.md$|hack/README\.md$|docs/volume-migration\.md$|docs/support-matrix\.md$|docs/architecture\.md$|docs/examples/.*\.md$|docs/adr/.*\.md$)' \
   | sed 's/^/UNMAPPED /' >> "$SCRATCH/docs.txt"
 cat "$SCRATCH/docs.txt"
-grep -lE '^func Test(SupportMatrix|ArchitectureDoc|Invariants|Examples|Readme|ADRs|NoDirectWarn|DirectWarn)' \
-  buildconfig/*_test.go 2>&1 | tee "$SCRATCH/keeper-tests.txt"
 git status --porcelain -- '*.md' > "$SCRATCH/md-before.txt"   # Stage 7 compares against this
 ```
 
-A missing keeper test is not an error. It means the base predates the docs PRs, and Stage 2
-is `SKIPPED (none on this base)`. An `UNMAPPED` doc joins the grep in Stage 3a and gets a
-`MEMORY.md` entry keyed `unmapped-doc:<path>` in Stage 7b.
+An `UNMAPPED` doc joins the grep in Stage 3a and gets a `MEMORY.md` entry keyed
+`unmapped-doc:<path>` in Stage 7b.
 
 ### 0d. Docs-only guard
 
@@ -294,14 +291,13 @@ The documentation tests are the oracle for the rows they guard. Run them before 
 any doc, so the proposals start from what CI would say:
 
 ```bash
-KEEPERS='TestSupportMatrix|TestArchitectureDoc|TestInvariants|TestExamples|TestReadme|TestADRs|TestNoDirectWarn|TestDirectWarn'
-cd "$WORK" && GOWORK=off go test ./buildconfig -run "$KEEPERS" -count=1 2>&1 \
+cd "$WORK" && GOWORK=off go test -tags documentation ./buildconfig -count=1 2>&1 \
   | grep -E 'FAIL|^ok|^---|\.go:[0-9]+:|^[[:space:]]{8,}|^#' | tee "$SCRATCH/keeper.txt"
 ```
 
 The filter keeps the verdict lines, the failure lines (`file_test.go:47: ...` and their
-indented continuations), compile errors, and `ok ... [no tests to run]`; it drops the
-`=== RUN` and `--- PASS` noise that made this stage the most expensive read in the run.
+indented continuations), and compile errors; it drops the `=== RUN` and `--- PASS` noise
+that made this stage the most expensive read in the run.
 
 Each failure names a doc and, usually, the row: "warning has no row in
 docs/support-matrix.md", "does not name main.go", "quotes W12, which no longer matches".
@@ -309,10 +305,6 @@ Carry every one into Stage 4 as a proposal with verdict `keeper-test`. A keeper 
 failure output, read as a whole, does **not** name the row is a `MEMORY.md` entry keyed
 `keeper-silent:<test>`; a test that prints the unrowed text on one line and the row id on
 the next has named it.
-
-`no tests to run` with an empty `keeper-tests.txt` means the base predates the docs PRs.
-Record `SKIPPED (none on this base)` and continue: the map still applies, CI just will not
-enforce it yet.
 
 `GOWORK=off` is what CI runs. The workspace `go.work` outside this repo resolves
 dependencies differently and can hide or invent a failure.
@@ -537,7 +529,7 @@ For each approved block, make the edit in `$WORK` and append its path to
    if grep -qE '\.go$|docs/examples/.*/expected/' "$SCRATCH/edited.txt"; then
      GOWORK=off go test ./... -count=1 2>&1
    else
-     GOWORK=off go test ./buildconfig -run "$KEEPERS" -count=1 2>&1
+      GOWORK=off go test -tags documentation ./buildconfig -count=1 2>&1
    fi | grep -E 'FAIL|^ok|^---|\.go:[0-9]+:|^[[:space:]]{8,}|^#' | tee "$SCRATCH/verify.txt"
    ```
 

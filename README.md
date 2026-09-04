@@ -198,18 +198,17 @@ to the target registry. The plugin warns either way.
 
 ## Testing
 
-Three levels.
+Three test levels, plus a separate documentation consistency check.
 
-**Unit tests**, no cluster:
+**Functional unit tests**, no cluster:
 
 ```bash
 GOTOOLCHAIN=auto go test ./...
 ```
 
-These include the tests that keep the documentation honest: the support matrix must list
-every warning the code can emit, the architecture page must name every file and step, the
-examples must match the plugin's output, and this README's flag examples and version numbers
-must match the code and CI.
+**Documentation consistency tests** run separately in the `Documentation tests` GitHub
+Actions workflow. They verify the support matrix, architecture page, examples, and this
+README against the code and CI pins.
 
 **Plugin E2E**, the binary driven by crane over sample exports, no cluster. Needs the pinned
 crane first on `PATH`:
@@ -227,7 +226,7 @@ BuildRun to completion:
 ./tests/e2e-cluster.sh --skip-build # verify the manifests only
 ```
 
-Pull requests run the unit tests and the cluster E2E.
+Pull requests run the functional unit tests, documentation consistency tests, and cluster E2E.
 
 ## Issue tracking
 

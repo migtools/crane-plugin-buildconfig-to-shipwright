@@ -107,8 +107,8 @@ read line by line. The architecture page's file table says the same thing: `chai
 
 Nothing else. In particular this list does not cover `hack/*` or `buildconfig/*_test.go`,
 because CI executes both: `.github/workflows/test-e2e-minikube-pr.yml` runs the `hack/`
-setup scripts, and `.github/workflows/go.yml` runs `go test ./...`, which compiles every
-test file. Code that runs on the CI runner is read line by line.
+setup scripts, and the Go and documentation workflows compile and run the test files. Code
+that runs on the CI runner is read line by line.
 
 ## Files where the maintainer reads your diff line by line
 
@@ -148,7 +148,7 @@ not exist on `main` yet. They are listed here so the table is complete when thos
 | `TestSupportMatrixCoversEveryWarning` | every warning template has a row in the matrix, and every quoted warning still exists | add or reword the row in `docs/support-matrix.md`. To retire a warning, keep its row and start the cell with `Retired by BUILD-` and the story number. Put no backticks anywhere in that cell: a backtick-quoted string is read as a live warning template, and the row then fails the doc-to-code check instead |
 | `TestArchitectureDocNamesEveryFileAndStage` | every non-test Go file and every `process*` method is named in the architecture page | add the line |
 | `TestInvariantsCiteRealTests` | every test the architecture page cites exists | rename it in the page, or restore the test |
-| `TestExamplesMatchCommittedOutput` | each `docs/examples/*/expected/` matches the plugin's output | `go test ./buildconfig -run TestExamplesMatchCommittedOutput -update` (once #66 to #68 land; the flag does not exist before that), then re-read that example's README. A regenerated expectation is a changed assertion, so it is read line by line like any other golden file |
+| `TestExamplesMatchCommittedOutput` | each `docs/examples/*/expected/` matches the plugin's output | `go test -tags documentation ./buildconfig -run TestExamplesMatchCommittedOutput -update` (once #66 to #68 land; the flag does not exist before that), then re-read that example's README. A regenerated expectation is a changed assertion, so it is read line by line like any other golden file |
 | `TestReadmeOptionalFlagsAreValidJSON`, `TestReadmeVersionsMatchPins` | README flag examples are JSON; README versions match `go.mod`, the Minikube script, and the CI crane pin | fix the README |
 | `TestADRsAreWellFormed` | every record has its parts and is in the index | fix the record |
 | `TestNoDirectWarnLoggingInConverter` | no `c.Log.Warn*` in a Converter method other than `warnf`, which is the single recording path | record the drop through `c.warnf` (ADR-0003) |
@@ -158,8 +158,9 @@ not exist on `main` yet. They are listed here so the table is complete when thos
 - The released crane (v0.0.5) silently produces no Builds with this plugin. Build crane from
   the commit `.github/workflows/test-e2e-minikube-pr.yml` pins, and put it first on `PATH`
   before running `tests/e2e-transform.sh`.
-- Run the Go suite as CI does: `GOWORK=off go test ./... -count=1`. The workspace `go.work`
-  outside this repo can resolve different dependency versions.
+- Run the functional suite as CI does: `GOWORK=off go test ./... -count=1`. The workspace
+  `go.work` outside this repo can resolve different dependency versions. Documentation tests
+  need the `documentation` build tag and run in `.github/workflows/documentation.yml`.
 - On OpenShift, `kubectl get build/<name>` is the OpenShift Build API. Write
   `build.shipwright.io/<name>`.
 - A BuildRun with `serviceAccount` unset runs as the namespace `pipeline` account. That is
@@ -183,4 +184,3 @@ git commit -s
 Write the commit message through the `/unslop` skill before committing, so it
 reads like a person wrote it. This holds for every commit, including the fixes an
 agent makes after a `/deep-review` pass.
-
